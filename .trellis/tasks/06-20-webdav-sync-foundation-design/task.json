@@ -19,7 +19,8 @@
   "pr_url": null,
   "subtasks": [],
   "children": [
-    "06-20-sync-snapshot-foundation"
+    "06-20-sync-snapshot-foundation",
+    "06-21-webdav-sync-v1"
   ],
   "parent": null,
   "relatedFiles": [],
