@@ -29,9 +29,11 @@ mXterm 是一个基于 Tauri v2、React 和 Rust 的个人桌面运维客户端�
 
 | 平台 | 产物 | 应用内更新 |
 |---|---|---|
+| Windows x64 | NSIS 安装包、绿色版 zip | 仅 NSIS 安装版 |
 | macOS Apple Silicon | Apple Silicon 安装/下载资产 | 支持 |
+| Linux x64 | AppImage、deb、rpm | 仅 AppImage |
 
-当前 GitHub Release 只发布 Apple Silicon。Windows、Linux 和 macOS Intel 暂不发布，也不会写入 `latest.json` 自动更新目标。
+首版不发布 macOS Intel。Windows 绿色版和 Linux deb/rpm 作为手动下载资产保留，不写入 `latest.json` 自动更新目标。
 
 ## 开发
 
@@ -52,7 +54,10 @@ pnpm test:release
 平台打包入口：
 
 ```powershell
+pnpm package:win
 pnpm package:mac-arm64
+pnpm package:linux
+pnpm package:all
 ```
 
 ## 发布流程
@@ -78,7 +83,7 @@ git tag vX.Y.Z
 git push github vX.Y.Z
 ```
 
-Release workflow 只构建 macOS Apple Silicon，并生成平台安装包、源码 zip、源码 tar.gz、`latest.json` 和 `SHA256SUMS.txt`。macOS Developer ID 签名和 notarization 暂未接入，workflow 中保留后续扩展入口。
+Release workflow 会构建 Windows x64、macOS Apple Silicon 和 Linux x64，并生成平台安装包、源码 zip、源码 tar.gz、`latest.json` 和 `SHA256SUMS.txt`。Windows 代码签名、macOS Developer ID 签名和 notarization 暂未接入，workflow 中保留后续扩展入口。
 
 ## 项目文档
 
