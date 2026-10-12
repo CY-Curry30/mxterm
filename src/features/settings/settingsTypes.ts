@@ -112,7 +112,12 @@ export interface CommandSettings {
   recordTerminalInputHistory: boolean;
 }
 
+export interface AiSettings {
+  runningSendBehavior: "queue" | "immediate";
+}
+
 export interface MxtermSettings {
+  ai: AiSettings;
   appearance: AppearanceSettings;
   basic: BasicSettings;
   command: CommandSettings;
@@ -210,6 +215,9 @@ export const terminalFontPresets: Array<{
 ];
 
 export const defaultSettings: MxtermSettings = {
+  ai: {
+    runningSendBehavior: "queue",
+  },
   basic: {
     autoCheckAppUpdate: true,
     closeWindowToTray: true,
@@ -274,6 +282,7 @@ export const defaultSettings: MxtermSettings = {
 
 export function normalizeSettings(value: unknown): MxtermSettings {
   const record = isRecord(value) ? value : {};
+  const ai = isRecord(record.ai) ? record.ai : {};
   const basic = isRecord(record.basic) ? record.basic : {};
   const fileTransfer = isRecord(record.fileTransfer) ? record.fileTransfer : {};
   const localTerminal = isRecord(record.localTerminal) ? record.localTerminal : {};
@@ -284,6 +293,13 @@ export function normalizeSettings(value: unknown): MxtermSettings {
   const terminalTheme = isRecord(record.terminalTheme) ? record.terminalTheme : {};
 
   return {
+    ai: {
+      runningSendBehavior: normalizeOneOf(
+        ai.runningSendBehavior,
+        ["queue", "immediate"],
+        defaultSettings.ai.runningSendBehavior,
+      ),
+    },
     basic: {
       autoCheckAppUpdate: normalizeBoolean(
         basic.autoCheckAppUpdate,

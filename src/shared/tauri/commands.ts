@@ -35,6 +35,7 @@ import type {
   AiChatSession,
   AiChatSessionSummary,
   AiChatStreamStartRequest,
+  AiChatStreamEnqueueRequest,
   AiChatStreamStartResponse,
   AiCommandAssessment,
   AiProviderConfig,
@@ -380,6 +381,10 @@ export function aiChatSessionClear(sessionId: string) {
 
 export function aiChatStreamStart(request: AiChatStreamStartRequest) {
   return invoke<AiChatStreamStartResponse>("ai_chat_stream_start", { request });
+}
+
+export function aiChatStreamEnqueue(request: AiChatStreamEnqueueRequest) {
+  return invoke<void>("ai_chat_stream_enqueue", { request });
 }
 
 export function aiChatStreamStop(streamId: string) {

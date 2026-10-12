@@ -10,7 +10,8 @@ use tokio::sync::Mutex;
 use crate::app_error::AppError;
 use crate::ssh_config::ResolvedSshConfig;
 use crate::terminal::session::{
-    ExecOutput, ExecOutputChunkCallback, ReusableExecSession, SshConnectionContext,
+    wait_for_cancellation, ExecOutput, ExecOutputChunkCallback, ReusableExecSession,
+    SshConnectionContext,
 };
 
 const DEFAULT_REMOTE_EXEC_SESSION_IDLE_TIMEOUT_MS: u64 = 180_000;
@@ -161,6 +162,49 @@ impl RemoteExecSessionPool {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) async fn exec_with_stdout_chunks_cancellable(
+        &self,
+        app: &AppHandle,
+        config: &ResolvedSshConfig,
+        command: &str,
+        chunks: ExecOutputChunkCallback,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(ExecOutput, bool), AppError> {
+        let cancelled_before_start = || {
+            Ok((
+                ExecOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    exit_status: None,
+                },
+                true,
+            ))
+        };
+        let connect = || ReusableExecSession::connect_resolved(app, config);
+        let handle = tokio::select! {
+            biased;
+            _ = wait_for_cancellation(cancel.clone()) => return cancelled_before_start(),
+            handle = self.session_handle_with_connector(config, &connect) => handle?,
+        };
+        let _use_guard = begin_handle_use(&handle);
+        let result = {
+            let session = tokio::select! {
+                biased;
+                _ = wait_for_cancellation(cancel.clone()) => return cancelled_before_start(),
+                session = handle.session.lock() => session,
+            };
+            session
+                .exec_with_stdout_chunks_cancellable(command, chunks, cancel)
+                .await
+        };
+        if result.is_ok() {
+            self.mark_handle_used(&handle).await;
+        } else {
+            self.invalidate_handle(&config.connection_id, &handle).await;
+        }
+        result
     }
 
     async fn exec_with_connector<F, Fut>(

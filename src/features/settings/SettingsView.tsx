@@ -19,6 +19,7 @@ import {
   Globe2,
   HardDrive,
   Keyboard,
+  ListPlus,
   KeyRound,
   Layers,
   Boxes,
@@ -47,6 +48,7 @@ import {
   Undo2,
   Waypoints,
   X,
+  Zap,
 } from "lucide-react";
 
 import { AppSelect } from "../../shared/ui/AppSelect";
@@ -105,6 +107,7 @@ import {
   normalizeLocalTerminalProfileInput,
   terminalFontPresets,
   type AccentColor,
+  type AiSettings,
   type AppearanceSettings,
   type BasicSettings,
   type CommandSettings,
@@ -173,6 +176,7 @@ interface SettingsViewProps {
   onEnableMasterPassword: (masterPassword: string) => Promise<boolean>;
   onUnlockSecuritySettings: (masterPassword: string) => Promise<boolean>;
   onUpdateAppearance: (update: Partial<AppearanceSettings>) => void;
+  onUpdateAi: (update: Partial<AiSettings>) => void;
   onUpdateBasic: (update: Partial<BasicSettings>) => void;
   onUpdateCommand: (update: Partial<CommandSettings>) => void;
   onUpdateFileTransfer: (update: Partial<FileTransferSettings>) => void;
@@ -230,6 +234,7 @@ export function SettingsView({
   onEnableMasterPassword,
   onUnlockSecuritySettings,
   onUpdateAppearance,
+  onUpdateAi,
   onUpdateBasic,
   onUpdateCommand,
   onUpdateFileTransfer,
@@ -340,7 +345,7 @@ export function SettingsView({
           />
         ) : null}
         {activeSection === "mcp" ? <McpSettingsSection connections={connections} /> : null}
-        {activeSection === "ai" ? <AiSettingsSection /> : null}
+        {activeSection === "ai" ? <AiSettingsSection settings={settings.ai} onUpdate={onUpdateAi} /> : null}
         {activeSection === "sync" ? <WebDavSyncSettingsSection /> : null}
         {activeSection === "shortcuts" ? (
           <ShortcutSettingsSection
@@ -384,7 +389,10 @@ const aiAccessModeOptions: Array<{ label: string; value: AiApiFormat }> = [
   { label: "Responses（/responses）", value: "responses" },
 ];
 
-function AiSettingsSection() {
+function AiSettingsSection({ settings, onUpdate }: {
+  settings: AiSettings;
+  onUpdate: (update: Partial<AiSettings>) => void;
+}) {
   const desktopRuntime = hasTauriRuntime();
   const [configs, setConfigs] = useState<AiProviderConfig[]>([]);
   const [selectedId, setSelectedId] = useState("");
@@ -728,6 +736,17 @@ function AiSettingsSection() {
         <h1>模型设置</h1>
         <p>管理自定义模型供应商，配置后可在聊天时选择使用。</p>
       </header>
+
+      <SettingsRow icon={Bot} title="运行中发送">
+        <SegmentedControl<AiSettings["runningSendBehavior"]>
+          options={[
+            { value: "queue", label: "加入队列", icon: ListPlus },
+            { value: "immediate", label: "立即插入", icon: Zap },
+          ]}
+          value={settings.runningSendBehavior}
+          onChange={(runningSendBehavior) => onUpdate({ runningSendBehavior })}
+        />
+      </SettingsRow>
 
       <div className="ai-settings-layout">
         <section className="settings-panel ai-settings-list-panel" aria-label="AI 配置列表">

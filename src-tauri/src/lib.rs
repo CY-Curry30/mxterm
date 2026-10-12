@@ -241,6 +241,7 @@ pub fn run() {
             ai_assistant::ai_chat_session_delete,
             ai_assistant::ai_chat_session_clear,
             ai_assistant::ai_chat_stream_start,
+            ai_assistant::ai_chat_stream_enqueue,
             ai_audit::ai_audit_list,
             ai_assistant::ai_chat_stream_stop,
             ai_assistant::ai_file_changes_undo,

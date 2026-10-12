@@ -1,6 +1,6 @@
 import { useCallback, useRef, useSyncExternalStore, type SetStateAction } from "react";
 
-import type { AiChatMessage, AiContextBlock } from "./aiTypes";
+import type { AiChatMessage, AiContextBlock, AiChatStreamStartRequest } from "./aiTypes";
 
 export const AI_HISTORY_SCOPE_CURRENT = "__current__";
 
@@ -10,12 +10,29 @@ export interface AiAssistantStreamState {
   assistantMessageId: string;
   sessionId: string;
   streamId: string;
+  ready?: boolean;
+  request?: AiChatStreamStartRequest;
+  stopRequested?: boolean;
+}
+
+export interface AiQueuedMessage {
+  id: string;
+  sessionId: string;
+  content: string;
+  contexts: AiContextBlock[];
+  request: AiChatStreamStartRequest;
+  immediate: boolean;
+  insertionStreamId?: string;
+  status: "queued" | "sending" | "accepted" | "failed";
+  error?: string;
 }
 
 export interface AiAssistantScopeState {
   activeSessionId: string | null;
   messages: AiChatMessage[];
   streamState: AiAssistantStreamState | null;
+  queuedMessages: AiQueuedMessage[];
+  queueAutoRun: boolean;
   contextBlocks: AiContextBlock[];
   input: string;
   remoteWorkspacePath: string | null;
@@ -40,6 +57,8 @@ function createDefaultScopeState(): AiAssistantScopeState {
     activeSessionId: null,
     messages: [],
     streamState: null,
+    queuedMessages: [],
+    queueAutoRun: false,
     contextBlocks: [],
     input: "",
     remoteWorkspacePath: null,

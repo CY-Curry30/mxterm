@@ -12,7 +12,7 @@ use std::future::Future;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -35,6 +35,17 @@ const REMOTE_EXEC_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const TERMINAL_OUTPUT_BATCH_MAX_BYTES: usize = 32 * 1024;
 const TERMINAL_OUTPUT_BATCH_MAX_WAIT: Duration = Duration::from_millis(8);
 const SFTP_REQUEST_TIMEOUT_SECS: u64 = 60;
+
+pub(crate) async fn wait_for_cancellation(mut cancel: watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow_and_update() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 pub(crate) struct TerminalOutputBatcher {
     pending: Vec<u8>,
@@ -649,7 +660,7 @@ impl ReusableExecSession {
     }
 
     pub async fn exec(&self, command: &str) -> Result<ExecOutput, AppError> {
-        self.exec_inner(command, None, None, None, None).await
+        self.exec_inner(command, None, None, None, None, None).await
     }
 
     pub async fn exec_with_stdin(
@@ -657,8 +668,15 @@ impl ReusableExecSession {
         command: &str,
         stdin: &[u8],
     ) -> Result<ExecOutput, AppError> {
-        self.exec_inner(command, Some(ExecStdin::Bytes(stdin)), None, None, None)
-            .await
+        self.exec_inner(
+            command,
+            Some(ExecStdin::Bytes(stdin)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn exec_with_stdin_progress(
@@ -671,6 +689,7 @@ impl ReusableExecSession {
             command,
             Some(ExecStdin::Bytes(stdin)),
             Some(progress),
+            None,
             None,
             None,
         )
@@ -689,6 +708,7 @@ impl ReusableExecSession {
             Some(progress),
             None,
             None,
+            None,
         )
         .await
     }
@@ -698,7 +718,7 @@ impl ReusableExecSession {
         command: &str,
         progress: ExecProgressCallback,
     ) -> Result<ExecOutput, AppError> {
-        self.exec_inner(command, None, None, Some(progress), None)
+        self.exec_inner(command, None, None, Some(progress), None, None)
             .await
     }
 
@@ -707,8 +727,28 @@ impl ReusableExecSession {
         command: &str,
         chunks: ExecOutputChunkCallback,
     ) -> Result<ExecOutput, AppError> {
-        self.exec_inner(command, None, None, None, Some(chunks))
+        self.exec_inner(command, None, None, None, Some(chunks), None)
             .await
+    }
+
+    pub(crate) async fn exec_with_stdout_chunks_cancellable(
+        &self,
+        command: &str,
+        chunks: ExecOutputChunkCallback,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(ExecOutput, bool), AppError> {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output = self
+            .exec_inner(
+                command,
+                None,
+                None,
+                None,
+                Some(chunks),
+                Some((cancel, cancelled.clone())),
+            )
+            .await?;
+        Ok((output, cancelled.load(std::sync::atomic::Ordering::SeqCst)))
     }
 
     pub async fn exec_streaming_stdout_chunks(
@@ -726,14 +766,28 @@ impl ReusableExecSession {
         stdin_progress: Option<ExecProgressCallback>,
         stdout_progress: Option<ExecProgressCallback>,
         stdout_chunks: Option<ExecOutputChunkCallback>,
+        cancellation: Option<(watch::Receiver<bool>, Arc<std::sync::atomic::AtomicBool>)>,
     ) -> Result<ExecOutput, AppError> {
-        let mut channel = run_with_timeout(
+        let cancel_wait = async {
+            match cancellation.as_ref() {
+                Some((cancel, _)) => wait_for_cancellation(cancel.clone()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(cancel_wait);
+        let channel = tokio::select! {
+            biased;
+            _ = &mut cancel_wait => {
+                if let Some((_, cancelled)) = cancellation.as_ref() { cancelled.store(true, std::sync::atomic::Ordering::SeqCst); }
+                return Ok(ExecOutput { stdout: Vec::new(), stderr: Vec::new(), exit_status: None });
+            }
+            result = run_with_timeout(
             "remote_exec_channel_timeout",
             "SSH 命令通道打开超时。",
             Duration::from_secs(20),
             self.client.channel_open_session(),
-        )
-        .await?
+        ) => result?,
+        }
         .map_err(|error| {
             AppError::new(
                 "remote_exec_channel_failed",
@@ -742,14 +796,17 @@ impl ReusableExecSession {
                 true,
             )
         })?;
+        let mut channel = ExecChannelGuard::new(channel);
 
-        run_with_timeout(
+        let started = tokio::select! {
+            biased;
+            _ = &mut cancel_wait => false,
+            result = run_with_timeout(
             "remote_exec_start_timeout",
             "远程命令启动超时。",
             Duration::from_secs(20),
             channel.exec(true, command),
-        )
-        .await?
+        ) => { result?
         .map_err(|error| {
             AppError::new(
                 "remote_exec_start_failed",
@@ -757,7 +814,20 @@ impl ReusableExecSession {
                 error,
                 true,
             )
-        })?;
+        })?; true },
+        };
+        if !started {
+            close_cancelled_exec_channel(&channel).await?;
+            channel.closed = true;
+            if let Some((_, cancelled)) = cancellation.as_ref() {
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            return Ok(ExecOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_status: None,
+            });
+        }
 
         if let Some(stdin) = stdin {
             match stdin {
@@ -817,7 +887,22 @@ impl ReusableExecSession {
         let mut stderr = Vec::new();
         let mut exit_status = None;
 
-        while let Some(message) = channel.wait().await {
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = &mut cancel_wait => {
+                    // Close this command's channel only. Other foreground or
+                    // background tasks may share the reusable SSH connection.
+                    close_cancelled_exec_channel(&channel).await?;
+                    channel.closed = true;
+                    if let Some((_, cancelled)) = cancellation.as_ref() { cancelled.store(true, std::sync::atomic::Ordering::SeqCst); }
+                    return Ok(ExecOutput { stdout, stderr, exit_status: None });
+                }
+                message = channel.wait() => message,
+            };
+            let Some(message) = message else {
+                break;
+            };
             match message {
                 ChannelMsg::Data { data } => {
                     if let Some(chunks) = stdout_chunks.as_ref() {
@@ -835,7 +920,7 @@ impl ReusableExecSession {
             }
         }
 
-        let _ = channel.close().await;
+        channel.closed = channel.close().await.is_ok();
 
         Ok(ExecOutput {
             stdout,
@@ -1261,6 +1346,85 @@ impl ReusableSftpSession {
                 .await;
         }
     }
+}
+
+// Read-only tools and timeouts may drop exec's future. russh's Channel does
+// not close on drop, so retain ownership until this command channel is closed.
+struct ExecChannelGuard {
+    channel: Option<Channel<client::Msg>>,
+    closed: bool,
+}
+
+impl ExecChannelGuard {
+    fn new(channel: Channel<client::Msg>) -> Self {
+        Self {
+            channel: Some(channel),
+            closed: false,
+        }
+    }
+}
+
+impl std::ops::Deref for ExecChannelGuard {
+    type Target = Channel<client::Msg>;
+
+    fn deref(&self) -> &Self::Target {
+        self.channel
+            .as_ref()
+            .expect("exec channel owned until drop")
+    }
+}
+
+impl std::ops::DerefMut for ExecChannelGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.channel
+            .as_mut()
+            .expect("exec channel owned until drop")
+    }
+}
+
+impl Drop for ExecChannelGuard {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let Some(channel) = self.channel.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = close_cancelled_exec_channel(&channel).await {
+                        eprintln!("Dropped SSH exec cleanup failed: {}", error.code);
+                    }
+                });
+            }
+            Err(_) => eprintln!("Dropped SSH exec cleanup unavailable: no async runtime"),
+        }
+    }
+}
+
+async fn close_cancelled_exec_channel(channel: &Channel<client::Msg>) -> Result<(), AppError> {
+    // Sending a signal is best effort: SSH servers need not honor it. Closing
+    // the channel is the confirmed boundary; do not claim remote process exit.
+    let _ = tokio::time::timeout(Duration::from_secs(2), channel.signal(russh::Sig::TERM)).await;
+    tokio::time::timeout(Duration::from_secs(2), channel.close())
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "ai_command_cancel_failed",
+                "关闭远程命令通道超时。",
+                error,
+                true,
+            )
+        })?
+        .map_err(|error| {
+            AppError::new(
+                "ai_command_cancel_failed",
+                "关闭远程命令通道失败。",
+                error,
+                true,
+            )
+        })
 }
 
 async fn send_stdin_chunk(
@@ -2022,6 +2186,10 @@ async fn authenticate(
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "session_preemption_tests.rs"]
+mod preemption_tests;
 
 #[cfg(test)]
 mod tests {

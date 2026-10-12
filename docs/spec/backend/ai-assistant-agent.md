@@ -39,6 +39,17 @@ SSH 文件搜索优先调用 `rg`，不可用时回退到 `find` / `grep`。搜�
 
 Agent 不设置固定工具调用轮次上限。模型继续返回工具调用时，执行工具并将真实结果交回模型；模型不再请求工具时结束本次回复。每轮模型请求前及每个工具执行前检查用户停止状态，接口或审计错误按原错误流程结束。
 
+## Message insertion lifecycle
+
+- `ai_chat_stream_enqueue` accepts only a live Agent stream and a UUID `queue_id`, content and contexts. The queue UUID becomes the persisted user-message ID. Validate and store attachments through the same session-artifact path as an ordinary send; do not change the run's provider, model, host or workspace.
+- The inbox accepts and closes under one lock. Pending and committed UUIDs are idempotent: a pending retry does nothing, and a committed retry re-emits its original `message_injected` receipt. Once closed, reject new entries with `ai_injection_closed` so the frontend can retain them for a later turn. Plain chat returns `ai_injection_unavailable`.
+- A newly accepted entry latches a cancellation signal until consumption. Interrupt the current model request (including connection and retry waits), discard incomplete tool calls, preserve emitted text, cancel read-only work and resolve pending approvals/questions as cancelled. Terminate and reap local foreground commands with their partial output; remote cancellation closes only the current command channel and must not claim remote process exit. Do not disconnect a shared SSH connection or cancel background tasks. Skip unstarted calls in the old batch and append a cancelled result for every call so all three provider formats remain valid. File mutations already past approval finish their write, recovery-index update and persistence before the handoff; they must never be dropped halfway through. Consume entries before the next model request after these real results are recorded.
+- In one SQLite transaction, finalize the previous assistant row with its real content, reasoning, tool records and status (`stopped` when preempted, `complete` when naturally finished), insert queued user rows in acceptance order, insert the new streaming assistant row, and update the session timestamp. Preserve the previous reply's file-change ownership and summary. Emit `message_injected` only after commit, with `queue_ids`, `previous_message`, `user_messages` and `assistant_message`.
+- The stream ID remains stable across insertion; the active assistant ID and its content/reasoning/tool buffers move to the new reply. Stop serializes against this boundary and persists the actual current reply. Background tool events retain their original message ownership.
+- Append inserted text and images after preceding tool results using each provider's native wire format. Anthropic merges adjacent user blocks while keeping tool results before inserted text/images. Add inserted attachment artifacts to `read_attachment`'s available session attachments.
+- `AiChatStreamStartRequest.client_ids` optionally supplies UUIDs for the stream, session and two message rows. Legacy callers may omit it. Complete request validation and commit both initial rows atomically before registering the stream; return the persisted `user_message` so the frontend can replace temporary attachment data. Remote workspace preparation runs inside the registered task and errors follow the normal stream-error path.
+- Enqueue acknowledgement is acceptance only. Unconsumed entries live in the runtime inbox; stopped/failed runs leave frontend entries available for explicit retry. When an acknowledgement or receipt is missing, the frontend must verify persisted user UUIDs after the run ends before starting another turn.
+
 ## 审计
 
 每次工具调用至少记录工具 ID、名称、工作区、连接、命令或文件路径、风险、审批结果、状态、开始/结束时间、退出码、输出截断标记和错误。日志内容需要限制大小并避免保存凭据。
@@ -68,6 +79,7 @@ Agent 不设置固定工具调用轮次上限。模型继续返回工具调用�
 - [x] **后台任务管理**：持久化任务状态、输出和时间；应用重启后标记 interrupted；本地任务可真实终止，远程任务明确停止确认边界。
 - [x] **审计日志界面**：增加查看、筛选和导出入口，确保 command、output、token、credential 脱敏。
 - [x] **Agent 计划与提问 UI**：为 update_plan 和 ask_user 增加专用展示、确认和状态。
+- [x] **Message queue and immediate insertion**: retain follow-ups per terminal scope and chat session, run ordinary queued sends in order, and let immediate Agent follow-ups take over foreground execution after cancellation or safe file-write completion. Preserve attachments and retries, reconcile missing receipts against persisted UUIDs, and update the UI before start IPC. Desktop send responsiveness and live-model interaction remain acceptance checks.
 - [x] **安全回归**：完成目标主机隔离、CAS 冲突、高危命令确认、审计失败即停、任务取消状态和前端/后端构建回归。
 
 每一项都必须有可观察状态和验证结果，未完成的操作不能在界面显示为成功。

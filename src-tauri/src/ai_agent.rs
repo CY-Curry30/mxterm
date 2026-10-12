@@ -28,11 +28,22 @@ use crate::app_error::AppError;
 use crate::remote_exec_pool::{RemoteExecRetry, RemoteExecSessionPool};
 use crate::remote_files::quote_posix_shell;
 use crate::ssh_config::ResolvedSshConfig;
-use crate::terminal::session::{ExecOutput, ExecOutputChunkCallback};
+use crate::terminal::session::{wait_for_cancellation, ExecOutput, ExecOutputChunkCallback};
 
 pub(crate) mod file_history;
 
 type OutputChunkCallback = Arc<dyn Fn(&[u8], &str) + Send + Sync>;
+
+/// A local search runs on Tokio's blocking pool, so dropping its async future
+/// cannot stop the worker by itself. The guard turns future cancellation into
+/// the cooperative flag checked by the native walker.
+struct SearchCancellationGuard(Arc<AtomicBool>);
+
+impl Drop for SearchCancellationGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 const AGENT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 60;
@@ -415,12 +426,20 @@ async fn load_remote_project_context(run: &AgentRun<'_>) -> String {
     let command = build_remote_project_context_command(run.agent.working_directory.as_deref());
     let result = timeout(
         Duration::from_secs(REMOTE_PROJECT_CONTEXT_TIMEOUT_SECONDS),
-        run.pool
-            .exec(run.app, config, &command, RemoteExecRetry::None),
+        run.pool.exec_with_stdout_chunks_cancellable(
+            run.app,
+            config,
+            &command,
+            Arc::new(|_| {}),
+            run.preemption.clone(),
+        ),
     )
     .await;
     let output = match result {
-        Ok(Ok(output)) => output,
+        Ok(Ok((_, true))) => {
+            return "【当前 SSH 工作区上下文】\n读取因新消息接管而取消，后续请通过文件工具读取项目规则。".into();
+        }
+        Ok(Ok((output, false))) => output,
         Ok(Err(error)) => {
             return format!("【当前 SSH 工作区上下文】\n读取失败（{}）。", error.code);
         }
@@ -484,7 +503,11 @@ pub(crate) struct AgentRun<'a> {
     pub tool_calls: Arc<StdMutex<Vec<AiToolCallRecord>>>,
     pub approvals: PendingApprovals,
     pub user_inputs: PendingUserInputs,
-    pub emitter: &'a StreamEmitter,
+    pub emitter: StreamEmitter,
+    pub current_message: Arc<StdMutex<crate::ai_assistant::AiActiveMessage>>,
+    pub inbox: Arc<StdMutex<crate::ai_assistant::AgentMessageInbox>>,
+    pub preemption: tokio::sync::watch::Receiver<bool>,
+    pub attachments: Vec<crate::ai_assistant::AiContextBlock>,
     pub pending_separator: AtomicBool,
     pub reasoning_level: Option<&'a str>,
     pub files: Arc<tokio::sync::Mutex<WorkspaceState>>,
@@ -694,7 +717,7 @@ struct AgentConversation {
 }
 
 pub(crate) async fn run_agent(
-    run: &AgentRun<'_>,
+    run: &mut AgentRun<'_>,
     history: Vec<AiModelMessage>,
 ) -> Result<(), AppError> {
     let client = Client::new();
@@ -706,12 +729,15 @@ pub(crate) async fn run_agent(
         history,
         configured_context_window(run.provider),
     );
+    let mut interrupted = false;
     loop {
         if run.is_stopped() {
             return Ok(());
         }
+        run.consume_messages(&mut conversation, false, interrupted)?;
+        interrupted = false;
         conversation.compact_if_needed(&system, false);
-        let turn = run_turn(
+        let (turn, preempted) = run_turn_with_preemption(
             &client,
             run.provider,
             run.api_key,
@@ -719,20 +745,37 @@ pub(crate) async fn run_agent(
             &system,
             &conversation.messages,
             Arc::clone(&run.stopped),
+            run.preemption.clone(),
             |delta| run.push_text(delta),
             |delta| run.push_thinking(delta),
         )
         .await?;
-        if run.is_stopped() || turn.tool_calls.is_empty() {
+        if preempted {
+            if !turn.text.trim().is_empty() {
+                conversation.push_assistant_turn(&turn);
+            }
+            run.consume_messages(&mut conversation, false, true)?;
+            continue;
+        }
+        if run.is_stopped() {
             return Ok(());
         }
         conversation.push_assistant_turn(&turn);
+        if turn.tool_calls.is_empty() {
+            // A message accepted while this request was in flight must receive
+            // another model turn. Closing and acceptance share the inbox lock.
+            if !run.consume_messages(&mut conversation, true, false)? {
+                return Ok(());
+            }
+            continue;
+        }
         let mut results = Vec::with_capacity(turn.tool_calls.len());
         for call in &turn.tool_calls {
             if run.is_stopped() {
                 return Ok(());
             }
             let outcome = run.execute_tool(call).await;
+            interrupted |= run.preemption_requested();
             if run.audit_failed.load(Ordering::SeqCst) {
                 return Err(AppError::new(
                     "ai_audit_failed",
@@ -777,6 +820,76 @@ fn configured_context_window(provider: &StoredAiProviderConfig) -> usize {
 }
 
 impl AgentRun<'_> {
+    fn consume_messages(
+        &mut self,
+        conversation: &mut AgentConversation,
+        finish_if_empty: bool,
+        interrupted: bool,
+    ) -> Result<bool, AppError> {
+        // Serialize the message boundary with stop: cancellation must persist
+        // either the old reply or the newly committed reply, never a mixture.
+        let mut current = self
+            .current_message
+            .lock()
+            .map_err(|error| AppError::new("ai_inbox_failed", "读取当前回复失败。", error, true))?;
+        if self.is_stopped() {
+            return Ok(false);
+        }
+        let mut inbox = self
+            .inbox
+            .lock()
+            .map_err(|error| AppError::new("ai_inbox_failed", "读取消息队列失败。", error, true))?;
+        let mut pending = inbox.take(finish_if_empty);
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let content = crate::ai_assistant::strip_tool_call_summary(
+            crate::ai_assistant::locked_string(&self.content),
+        );
+        let thinking = crate::ai_assistant::locked_string(&self.thinking);
+        let tool_calls = self
+            .tool_calls
+            .lock()
+            .map_err(|error| AppError::new("ai_inbox_failed", "读取工具状态失败。", error, true))?
+            .clone();
+        let injection = crate::ai_assistant::persist_message_injection(
+            self.app,
+            &self.emitter,
+            &content,
+            &thinking,
+            &tool_calls,
+            &mut pending,
+            interrupted,
+        )?;
+        inbox.record_commit(&injection);
+        let next_emitter = self
+            .emitter
+            .for_message(injection.assistant_message.id.clone());
+        // Reset only after persistence, and route cancellation to the new reply.
+        self.content = Arc::new(StdMutex::new(String::new()));
+        self.thinking = Arc::new(StdMutex::new(String::new()));
+        self.tool_calls = Arc::new(StdMutex::new(Vec::new()));
+        self.pending_separator.store(false, Ordering::SeqCst);
+        *current = crate::ai_assistant::AiActiveMessage {
+            content: self.content.clone(),
+            thinking: self.thinking.clone(),
+            tool_calls: self.tool_calls.clone(),
+            emitter: next_emitter.clone(),
+        };
+        self.emitter.complete_message();
+        self.emitter.injected(injection);
+        self.emitter = next_emitter;
+        for item in pending {
+            self.attachments.extend(
+                item.user_message
+                    .contexts
+                    .into_iter()
+                    .filter(|block| block.artifact_id.is_some()),
+            );
+            conversation.push_user_message(item.model_message);
+        }
+        Ok(true)
+    }
     fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
@@ -957,6 +1070,32 @@ impl AgentRun<'_> {
         }
     }
 
+    fn preemption_requested(&self) -> bool {
+        *self.preemption.borrow()
+    }
+
+    fn cancel_tool(&self, mut record: AiToolCallRecord, reason: &str) -> ToolOutcome {
+        // Preserve actual metadata and output from the running tool.
+        if let Ok(calls) = self.tool_calls.lock() {
+            if let Some(current) = calls.iter().find(|item| item.id == record.id) {
+                record = current.clone();
+            }
+        }
+        self.finish_cancelled_tool(record, reason)
+    }
+
+    fn finish_cancelled_tool(&self, mut record: AiToolCallRecord, reason: &str) -> ToolOutcome {
+        record.status = TOOL_STATUS_CANCELLED.into();
+        record.error = Some(reason.into());
+        record.finished_at_ms = Some(now_millis());
+        let content = format!("{reason}\n{}", record.output);
+        self.upsert_tool_call(&record);
+        ToolOutcome {
+            content,
+            is_error: true,
+        }
+    }
+
     async fn complete_file_preview(
         &self,
         mut record: AiToolCallRecord,
@@ -1008,6 +1147,9 @@ impl AgentRun<'_> {
             .as_ref()
             .map(|config| config.connection_id.clone());
         record.workspace = self.agent.working_directory.clone();
+        if self.preemption_requested() {
+            return self.cancel_tool(record, "新消息已接管，工具未执行。");
+        }
         if matches!(
             call.name.as_str(),
             "read_file"
@@ -1055,6 +1197,33 @@ impl AgentRun<'_> {
                 record.workspace = self.agent.working_directory.clone();
             }
         }
+        // Read-only operations can be dropped. Mutations and background-task
+        // management finish their transaction; foreground commands and approval
+        // waits implement cancellation themselves so their resources are reaped.
+        if matches!(
+            call.name.as_str(),
+            "read_file"
+                | "glob"
+                | "grep"
+                | "preview_patch"
+                | "preview_file_change"
+                | TOOL_WEB_SEARCH
+                | TOOL_WEB_FETCH
+        ) {
+            return tokio::select! {
+                biased;
+                _ = wait_for_cancellation(self.preemption.clone()) => self.cancel_tool(record.clone(), "新消息已接管，已取消当前读取。"),
+                outcome = self.dispatch_tool(call, record.clone()) => outcome,
+            };
+        }
+        self.dispatch_tool(call, record).await
+    }
+
+    async fn dispatch_tool(
+        &self,
+        call: &AgentToolCall,
+        mut record: AiToolCallRecord,
+    ) -> ToolOutcome {
         match call.name.as_str() {
             "read_file"
             | "glob"
@@ -1097,7 +1266,10 @@ impl AgentRun<'_> {
                 let answer = self.request_user_input(&mut record).await;
                 if answer.cancelled {
                     ToolOutcome {
-                        content: "用户取消了选择，请停止依赖此选择的操作。".into(),
+                        content: record
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "用户取消了选择，请停止依赖此选择的操作。".into()),
                         is_error: true,
                     }
                 } else {
@@ -1173,10 +1345,25 @@ impl AgentRun<'_> {
             }
             return false;
         }
-        let approved = receiver.await.unwrap_or(false);
+        let approved = wait_for_agent_input(receiver, self.preemption.clone()).await;
         if let Ok(mut approvals) = self.approvals.lock() {
             approvals.remove(&record.id);
         }
+        let Some(approved) = approved else {
+            record.approval_decision = Some("cancelled".into());
+            record.status = TOOL_STATUS_CANCELLED.into();
+            record.error = Some(
+                if self.preemption_requested() {
+                    "新消息已接管，已取消审批，操作未执行。"
+                } else {
+                    "审批等待已结束，操作未执行。"
+                }
+                .into(),
+            );
+            record.finished_at_ms = Some(now_millis());
+            self.upsert_tool_call(record);
+            return false;
+        };
         record.approval_decision = Some(if approved { "approved" } else { "rejected" }.into());
         if approved {
             record.status = TOOL_STATUS_RUNNING.into();
@@ -1193,6 +1380,14 @@ impl AgentRun<'_> {
     }
 
     async fn request_file_approval(&self, record: &mut AiToolCallRecord) -> bool {
+        if self.preemption_requested() {
+            record.approval_decision = Some("cancelled".into());
+            record.status = TOOL_STATUS_CANCELLED.into();
+            record.error = Some("新消息已接管，文件操作未执行。".into());
+            record.finished_at_ms = Some(now_millis());
+            self.upsert_tool_call(record);
+            return false;
+        }
         if self.agent.mode == AiAgentMode::Full {
             record.approval_required = false;
             record.approval_decision = Some("full_access".into());
@@ -1227,11 +1422,14 @@ impl AgentRun<'_> {
                 cancelled: true,
             };
         }
-        let answer = receiver.await.unwrap_or(AiUserAnswer {
+        let cancelled = AiUserAnswer {
             option_id: None,
             text: None,
             cancelled: true,
-        });
+        };
+        let answer = wait_for_agent_input(receiver, self.preemption.clone())
+            .await
+            .unwrap_or(cancelled);
         if let Ok(mut inputs) = self.user_inputs.lock() {
             inputs.remove(&record.id);
         }
@@ -1250,6 +1448,9 @@ impl AgentRun<'_> {
             TOOL_STATUS_COMPLETED.to_string()
         };
         record.finished_at_ms = Some(now_millis());
+        if answer.cancelled && self.preemption_requested() {
+            record.error = Some("新消息已接管，已取消当前提问。".into());
+        }
         self.upsert_tool_call(record);
         answer
     }
@@ -1285,6 +1486,9 @@ impl AgentRun<'_> {
         {
             if self.audit_failed.load(Ordering::SeqCst) {
                 return Err(self.fail_tool(record.clone(), "审计保存失败，命令未执行。".into()));
+            }
+            if record.status == TOOL_STATUS_CANCELLED {
+                return Err(approval_denied_outcome(record, "命令没有执行。"));
             }
             return Err(ToolOutcome {
                 content: "命令未获用户确认或运行已停止，没有执行。请停止依赖该命令的操作。".into(),
@@ -1455,10 +1659,7 @@ impl AgentRun<'_> {
             );
         }
         if !self.request_file_approval(&mut record).await {
-            return ToolOutcome {
-                content: "用户拒绝应用远程文件变更。".into(),
-                is_error: false,
-            };
+            return approval_denied_outcome(&record, "用户拒绝应用远程文件变更。");
         }
         let current_now = match self
             .pool
@@ -1650,10 +1851,7 @@ impl AgentRun<'_> {
         record.command = Some(format!("rollback:{backup_id}"));
         record.output = patch.diff.clone();
         if !self.request_file_approval(&mut record).await {
-            return ToolOutcome {
-                content: "用户拒绝回滚远程文件。".into(),
-                is_error: false,
-            };
+            return approval_denied_outcome(&record, "用户拒绝回滚远程文件。");
         }
 
         let manager = self.app.state::<crate::remote_files::RemoteFileManager>();
@@ -1828,9 +2026,10 @@ impl AgentRun<'_> {
             let root = root.to_path_buf();
             let tool = call.name.clone();
             let options = options.clone();
-            let stopped = Arc::clone(&self.stopped);
+            let search_stopped = Arc::new(AtomicBool::new(false));
+            let _search_cancellation = SearchCancellationGuard(Arc::clone(&search_stopped));
             match tokio::task::spawn_blocking(move || {
-                crate::ai_search::search_local(&root, &tool, &options, &stopped)
+                crate::ai_search::search_local(&root, &tool, &options, &search_stopped)
                     .map(|data| data.page(&tool, &options, "native", Vec::new()))
             })
             .await
@@ -2229,10 +2428,7 @@ impl AgentRun<'_> {
         ));
         record.output = summary.clone();
         if !self.request_file_approval(&mut record).await {
-            return ToolOutcome {
-                content: "用户拒绝整体回滚。".into(),
-                is_error: false,
-            };
+            return approval_denied_outcome(&record, "用户拒绝整体回滚。");
         }
         let mut rolled_back = Vec::new();
         for (id, patch) in patches.iter().rev() {
@@ -2454,10 +2650,7 @@ impl AgentRun<'_> {
             };
             path = patch.path.clone();
             if !self.request_file_approval(&mut record).await {
-                return ToolOutcome {
-                    content: "用户拒绝应用补丁。".into(),
-                    is_error: false,
-                };
+                return approval_denied_outcome(&record, "用户拒绝应用补丁。");
             }
             let Some(config) = self.agent.config.clone() else {
                 return self.fail_tool(record, "Agent 工作区未绑定连接。".into());
@@ -2692,10 +2885,7 @@ impl AgentRun<'_> {
                     };
                     record.output = patch.diff.clone();
                     if !self.request_file_approval(&mut record).await {
-                        return ToolOutcome {
-                            content: "用户拒绝文件操作。".into(),
-                            is_error: false,
-                        };
+                        return approval_denied_outcome(&record, "用户拒绝文件操作。");
                     }
                     let current = match crate::ai_workspace::read_version(root, &patch.path) {
                         Ok(value) => value,
@@ -2859,10 +3049,7 @@ impl AgentRun<'_> {
                     };
                     record.output = patch.diff.clone();
                     if !self.request_file_approval(&mut record).await {
-                        return ToolOutcome {
-                            content: "用户拒绝应用补丁。".into(),
-                            is_error: false,
-                        };
+                        return approval_denied_outcome(&record, "用户拒绝应用补丁。");
                     }
                     let backup_dir = self
                         .app
@@ -2906,10 +3093,7 @@ impl AgentRun<'_> {
                             return self.fail_tool(record, "Agent 配置尚未解析。".into());
                         };
                         if !self.request_file_approval(&mut record).await {
-                            return ToolOutcome {
-                                content: "用户拒绝回滚远程文件操作。".into(),
-                                is_error: false,
-                            };
+                            return approval_denied_outcome(&record, "用户拒绝回滚远程文件操作。");
                         }
                         let result = match patch.action.as_str() {
                             "create" => self
@@ -3008,10 +3192,7 @@ impl AgentRun<'_> {
                         }
                         record.output = format!("rollback {} {}", patch.action, patch.path);
                         if !self.request_file_approval(&mut record).await {
-                            return ToolOutcome {
-                                content: "用户拒绝回滚文件操作。".into(),
-                                is_error: false,
-                            };
+                            return approval_denied_outcome(&record, "用户拒绝回滚文件操作。");
                         }
                         let result: Result<String, AppError> = match patch.action.as_str() {
                             "create" | "write" if patch.before.is_none() => {
@@ -3102,10 +3283,7 @@ impl AgentRun<'_> {
                     };
                     record.output = diff;
                     if !self.request_file_approval(&mut record).await {
-                        return ToolOutcome {
-                            content: "用户拒绝回滚文件。".into(),
-                            is_error: false,
-                        };
+                        return approval_denied_outcome(&record, "用户拒绝回滚文件。");
                     }
                     let backup_dir = match self.app.path().app_data_dir() {
                         Ok(path) => path.join("ai-agent-backups"),
@@ -3556,6 +3734,9 @@ impl AgentRun<'_> {
         command: String,
         limit: Duration,
     ) -> ToolOutcome {
+        if self.preemption_requested() {
+            return self.cancel_tool(record, "新消息已接管，命令未执行。");
+        }
         record.status = TOOL_STATUS_RUNNING.to_string();
         record.started_at_ms = Some(now_millis());
         if !self.upsert_tool_call(&record) || self.stopped.load(Ordering::SeqCst) {
@@ -3582,11 +3763,17 @@ impl AgentRun<'_> {
                 stream,
             );
         });
+        let cancelled = Arc::new(AtomicBool::new(false));
         let result = match (&self.agent.config, &self.agent.host_local_directory) {
             (Some(config), None) => match timeout(
                 limit,
-                self.pool
-                    .exec_with_stdout_chunks(self.app, config, &script, remote_chunks),
+                self.pool.exec_with_stdout_chunks_cancellable(
+                    self.app,
+                    config,
+                    &script,
+                    remote_chunks,
+                    self.preemption.clone(),
+                ),
             )
             .await
             {
@@ -3603,10 +3790,17 @@ impl AgentRun<'_> {
                     ))
                 }
             },
-            (None, Some(root)) => {
-                run_local_command_streaming(root, &command, limit, None, None, Some(local_chunks))
-                    .await
-            }
+            (None, Some(root)) => run_local_command_streaming(
+                root,
+                &command,
+                limit,
+                None,
+                Some(cancelled.clone()),
+                Some(local_chunks),
+                Some(self.preemption.clone()),
+            )
+            .await
+            .map(|output| (output, cancelled.load(Ordering::SeqCst))),
             _ => Err(AppError::new(
                 "ai_agent_workspace_invalid",
                 "Agent 工作区状态无效。",
@@ -3616,7 +3810,7 @@ impl AgentRun<'_> {
         };
         record.duration_ms = Some(started.elapsed().as_millis() as u64);
         record.finished_at_ms = Some(now_millis());
-        let output = match result {
+        let (output, cancelled) = match result {
             Ok(output) => output,
             Err(error) => return self.fail_tool(record, error.message),
         };
@@ -3630,7 +3824,9 @@ impl AgentRun<'_> {
             &combine_output_preview(&stdout, &stderr),
             MAX_RECORD_OUTPUT_CHARS,
         );
-        record.status = if output.exit_status == Some(0) {
+        record.status = if cancelled {
+            TOOL_STATUS_CANCELLED
+        } else if output.exit_status == Some(0) {
             TOOL_STATUS_COMPLETED
         } else {
             TOOL_STATUS_FAILED
@@ -3650,6 +3846,19 @@ impl AgentRun<'_> {
             Err(error) => return self.fail_tool(record, error.message),
         };
         record.output_artifact_id = artifact_id;
+        if cancelled {
+            let reason = if self.agent.config.is_some() {
+                "新消息已接管，已关闭当前 SSH 命令通道；未确认远程进程已退出。"
+            } else {
+                "新消息已接管，本地命令已终止。"
+            };
+            record.error = Some(reason.into());
+            self.upsert_tool_call(&record);
+            return ToolOutcome {
+                content: format!("{reason}\n{content}"),
+                is_error: true,
+            };
+        }
         self.upsert_tool_call(&record);
         ToolOutcome {
             content,
@@ -3705,7 +3914,6 @@ impl AgentRun<'_> {
         record.command = Some(format!("attachment:{attachment_id}"));
         record.workspace = Some("session_attachment".to_string());
         let Some(attachment) = self
-            .agent
             .attachments
             .iter()
             .find(|item| item.artifact_id.as_deref() == Some(attachment_id))
@@ -3931,6 +4139,36 @@ fn save_output_artifact_for_session(
 }
 
 impl AgentConversation {
+    fn push_user_message(&mut self, message: AiModelMessage) {
+        let encoded = Self::new(self.format, vec![message], self.context_window_tokens);
+        if self.format == AiApiFormat::Anthropic {
+            // Tool results are user blocks in Anthropic. Merge adjacent user
+            // messages without moving the insertion ahead of its tool results.
+            for mut message in encoded.messages {
+                if let Some(last) = self
+                    .messages
+                    .last_mut()
+                    .filter(|last| last["role"] == "user")
+                {
+                    let mut content = match last["content"].take() {
+                        Value::Array(content) => content,
+                        Value::String(text) => vec![json!({"type":"text", "text":text})],
+                        _ => Vec::new(),
+                    };
+                    match message["content"].take() {
+                        Value::Array(parts) => content.extend(parts),
+                        Value::String(text) => content.push(json!({"type":"text", "text":text})),
+                        _ => {}
+                    }
+                    last["content"] = Value::Array(content);
+                } else {
+                    self.messages.push(message);
+                }
+            }
+        } else {
+            self.messages.extend(encoded.messages);
+        }
+    }
     fn new(
         format: AiApiFormat,
         history: Vec<AiModelMessage>,
@@ -4487,6 +4725,34 @@ impl TurnAccumulator {
     }
 }
 
+async fn run_turn_with_preemption(
+    client: &Client,
+    provider: &StoredAiProviderConfig,
+    api_key: &str,
+    reasoning_level: Option<&str>,
+    system: &str,
+    messages: &[Value],
+    stopped: Arc<AtomicBool>,
+    preemption: tokio::sync::watch::Receiver<bool>,
+    mut on_delta: impl FnMut(String),
+    on_thinking: impl FnMut(String),
+) -> Result<(AgentTurn, bool), AppError> {
+    let partial_text = StdMutex::new(String::new());
+    tokio::select! {
+        biased;
+        _ = wait_for_cancellation(preemption) => {
+            // Incomplete tool arguments must never be replayed or executed.
+            let text = partial_text.lock().map_err(|error| AppError::new("ai_stream_state_failed", "读取已生成内容失败。", error, true))?.clone();
+            Ok((AgentTurn { text, ..AgentTurn::default() }, true))
+        }
+        result = run_turn(client, provider, api_key, reasoning_level, system, messages, stopped,
+            |delta| {
+                if let Ok(mut text) = partial_text.lock() { text.push_str(&delta); }
+                on_delta(delta);
+            }, on_thinking) => result.map(|turn| (turn, false)),
+    }
+}
+
 async fn run_turn<F>(
     client: &Client,
     provider: &StoredAiProviderConfig,
@@ -4861,6 +5127,40 @@ fn approval_allows_execution(approved: bool, audited: bool, stopped: bool) -> bo
     approved && audited && !stopped
 }
 
+async fn wait_for_agent_input<T>(
+    receiver: oneshot::Receiver<T>,
+    preemption: tokio::sync::watch::Receiver<bool>,
+) -> Option<T> {
+    let answer = tokio::select! {
+        biased;
+        _ = wait_for_cancellation(preemption.clone()) => None,
+        answer = receiver => answer.ok(),
+    };
+    answer.filter(|_| !*preemption.borrow())
+}
+
+fn approval_denied_outcome(record: &AiToolCallRecord, rejected_message: &str) -> ToolOutcome {
+    if record.status == TOOL_STATUS_CANCELLED {
+        ToolOutcome {
+            content: record
+                .error
+                .clone()
+                .unwrap_or_else(|| "操作已取消，没有执行。".into()),
+            is_error: true,
+        }
+    } else if record.status == TOOL_STATUS_REJECTED {
+        ToolOutcome {
+            content: rejected_message.into(),
+            is_error: false,
+        }
+    } else {
+        ToolOutcome {
+            content: "操作未获确认或运行已停止，没有执行。".into(),
+            is_error: true,
+        }
+    }
+}
+
 // Full access skips approval for risky commands; recursive deletion of the host
 // root remains blocked before execution.
 fn assess_agent_command(command: &str) -> (AiCommandAssessment, bool) {
@@ -5155,7 +5455,18 @@ async fn run_local_command_streaming(
     cancel_notify: Option<Arc<Notify>>,
     stop_confirmed: Option<Arc<AtomicBool>>,
     on_chunk: Option<OutputChunkCallback>,
+    preemption: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<ExecOutput, AppError> {
+    if preemption.as_ref().is_some_and(|signal| *signal.borrow()) {
+        if let Some(cancelled) = stop_confirmed.as_ref() {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+        return Ok(ExecOutput {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_status: None,
+        });
+    }
     let mut process = if cfg!(windows) {
         let mut process = Command::new("powershell.exe");
         process.args([
@@ -5173,6 +5484,7 @@ async fn run_local_command_streaming(
         process.args(["-lc", command]);
         process
     };
+    local_process::LocalCommandTree::configure(&mut process);
     let mut child = process
         .current_dir(root)
         .stdin(Stdio::null())
@@ -5183,6 +5495,7 @@ async fn run_local_command_streaming(
         .map_err(|error| {
             AppError::new("ai_local_command_failed", "启动本地命令失败。", error, true)
         })?;
+    let mut process_tree = local_process::LocalCommandTree::attach(&child)?;
     let mut stdout = child.stdout.take().ok_or_else(|| {
         AppError::new(
             "ai_task_output_unavailable",
@@ -5247,13 +5560,23 @@ async fn run_local_command_streaming(
         Ok::<(), std::io::Error>(())
     });
     let cancel_wait = async move {
-        match cancel_notify {
-            Some(notify) => notify.notified().await,
-            None => std::future::pending::<()>().await,
+        tokio::select! {
+            _ = async {
+                match cancel_notify {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {},
+            _ = async {
+                match preemption {
+                    Some(signal) => wait_for_cancellation(signal).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {},
         }
     };
     tokio::pin!(cancel_wait);
-    let (status, cancelled, stdout_bytes, stderr_bytes) = timeout(limit, async {
+    let result = timeout(limit, async {
         let mut status = None;
         let mut cancelled = false;
         let mut closed_streams = 0usize;
@@ -5281,10 +5604,11 @@ async fn run_local_command_streaming(
                     }
                 }
                 _ = &mut cancel_wait, if !cancelled => {
-                    let kill_result = child.kill().await;
+                    let kill_result = process_tree.terminate();
                     if let Some(stop_confirmed) = stop_confirmed.as_ref() {
                         stop_confirmed.store(kill_result.is_ok(), Ordering::SeqCst);
                     }
+                    kill_result?;
                     status = Some(child.wait().await.map_err(|error| AppError::new("ai_local_command_failed", "停止本地命令失败。", error, true))?);
                     cancelled = true;
                 }
@@ -5296,7 +5620,27 @@ async fn run_local_command_streaming(
         Ok::<_, AppError>((status, cancelled, stdout_bytes, stderr_bytes))
     })
     .await
-    .map_err(|_| AppError::new("ai_command_timeout", "本地命令执行超时。", format!("timeout_seconds={}", limit.as_secs()), true))??;
+    .map_err(|_| AppError::new("ai_command_timeout", "本地命令执行超时。", format!("timeout_seconds={}", limit.as_secs()), true))
+    .and_then(|result| result);
+    let (status, cancelled, stdout_bytes, stderr_bytes) = match result {
+        Ok(output) => output,
+        Err(error) => {
+            stdout_reader.abort();
+            stderr_reader.abort();
+            // Reap resources on timeout or cancellation failure too.
+            if let Err(cleanup) = process_tree.terminate() {
+                return Err(AppError::new(
+                    &error.code,
+                    &error.message,
+                    format!("{}; cleanup: {}", error.raw_message, cleanup.raw_message),
+                    true,
+                ));
+            }
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    };
+    process_tree.release()?;
     let _ = stdout_reader.await;
     let _ = stderr_reader.await;
     Ok(ExecOutput {
@@ -5326,6 +5670,7 @@ async fn run_local_background_command(
         Some(Arc::clone(&entry.cancel_notify)),
         Some(Arc::clone(&entry.stop_confirmed)),
         Some(on_chunk),
+        None,
     )
     .await
 }
@@ -5636,6 +5981,13 @@ fn format_full_output_section(label: &str, value: &str) -> String {
         format!("{label}:\n{trimmed}")
     }
 }
+
+#[path = "ai_agent/local_process.rs"]
+mod local_process;
+
+#[cfg(test)]
+#[path = "ai_agent/preemption_tests.rs"]
+mod preemption_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6039,6 +6391,92 @@ mod tests {
         assert_eq!(anthropic.messages[1]["role"], "user");
         assert_eq!(anthropic.messages[1]["content"][0]["type"], "tool_result");
         assert_eq!(anthropic.messages[1]["content"][0]["is_error"], true);
+    }
+
+    #[test]
+    fn conversation_injection_keeps_tool_results_before_text_and_images_in_all_formats() {
+        let turn = AgentTurn {
+            thinking: String::new(),
+            text: String::new(),
+            tool_calls: vec![AgentToolCall {
+                id: "call-injection".into(),
+                name: "run_command".into(),
+                arguments: r#"{"command":"echo demo"}"#.into(),
+            }],
+        };
+        for format in [
+            AiApiFormat::OpenaiCompatible,
+            AiApiFormat::Responses,
+            AiApiFormat::Anthropic,
+        ] {
+            let mut conversation =
+                AgentConversation::new(format, Vec::new(), MAX_CONTEXT_WINDOW_TOKENS);
+            conversation.push_assistant_turn(&turn);
+            conversation.push_tool_results(&[(
+                turn.tool_calls[0].clone(),
+                ToolOutcome {
+                    content: "tool finished".into(),
+                    is_error: true,
+                },
+            )]);
+            conversation.push_user_message(AiModelMessage {
+                role: "user".into(),
+                content: "look at this image".into(),
+                images: vec![crate::ai_assistant::AiImageAttachment {
+                    title: "demo.png".into(),
+                    media_type: "image/png".into(),
+                    data_base64: "demo".into(),
+                }],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+            conversation.push_user_message(AiModelMessage {
+                role: "user".into(),
+                content: "second insertion".into(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+            match format {
+                AiApiFormat::OpenaiCompatible => {
+                    assert_eq!(conversation.messages[1]["role"], "tool");
+                    assert_eq!(conversation.messages[1]["tool_call_id"], "call-injection");
+                    assert_eq!(
+                        conversation.messages[2]["content"][0]["text"],
+                        "look at this image"
+                    );
+                    assert_eq!(conversation.messages[2]["content"][1]["type"], "image_url");
+                    assert_eq!(conversation.messages[3]["content"], "second insertion");
+                }
+                AiApiFormat::Responses => {
+                    assert_eq!(conversation.messages[1]["type"], "function_call_output");
+                    assert_eq!(conversation.messages[1]["call_id"], "call-injection");
+                    assert_eq!(
+                        conversation.messages[2]["content"][0]["text"],
+                        "look at this image"
+                    );
+                    assert_eq!(
+                        conversation.messages[2]["content"][1]["type"],
+                        "input_image"
+                    );
+                    assert_eq!(
+                        conversation.messages[3]["content"][0]["text"],
+                        "second insertion"
+                    );
+                }
+                AiApiFormat::Anthropic => {
+                    assert_eq!(conversation.messages.len(), 2);
+                    let content = &conversation.messages[1]["content"];
+                    assert_eq!(content[0]["type"], "tool_result");
+                    assert_eq!(content[0]["tool_use_id"], "call-injection");
+                    assert_eq!(content[0]["is_error"], true);
+                    assert_eq!(content[1]["text"], "look at this image");
+                    assert_eq!(content[2]["type"], "image");
+                    assert_eq!(content[2]["source"]["data"], "demo");
+                    assert_eq!(content[3]["text"], "second insertion");
+                }
+            }
+        }
     }
 
     #[test]

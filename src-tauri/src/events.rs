@@ -86,6 +86,14 @@ pub struct AiBackgroundTaskEvent {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct AiMessageInjectionEvent {
+    pub queue_ids: Vec<String>,
+    pub previous_message: crate::ai_assistant::AiChatMessage,
+    pub user_messages: Vec<crate::ai_assistant::AiChatMessage>,
+    pub assistant_message: crate::ai_assistant::AiChatMessage,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct AiChatStreamEvent {
     pub kind: String,
     pub stream_id: String,
@@ -99,4 +107,5 @@ pub struct AiChatStreamEvent {
     pub tool_output: Option<AiToolOutputEvent>,
     pub background_task: Option<AiBackgroundTaskEvent>,
     pub file_changes: Option<Vec<crate::ai_agent::file_history::AiFileChangeSummary>>,
+    pub injection: Option<AiMessageInjectionEvent>,
 }

@@ -10,6 +10,7 @@ export type AiChatStreamKind =
   | "tool_output"
   | "background_task"
   | "file_changes"
+  | "message_injected"
   | "finished"
   | "error"
   | "stopped";
@@ -249,6 +250,28 @@ export interface AiChatStreamStartRequest {
   model?: string | null;
   host_scope?: string | null;
   connection_id?: string | null;
+  client_ids?: AiChatClientIds;
+}
+
+export interface AiChatClientIds {
+  stream_id: string;
+  session_id: string;
+  user_message_id: string;
+  assistant_message_id: string;
+}
+
+export interface AiChatStreamEnqueueRequest {
+  stream_id: string;
+  queue_id: string;
+  content: string;
+  contexts: AiContextBlock[];
+}
+
+export interface AiMessageInjectionEvent {
+  queue_ids: string[];
+  previous_message: AiChatMessage;
+  user_messages: AiChatMessage[];
+  assistant_message: AiChatMessage;
 }
 
 export interface AiAgentRequest {
@@ -263,6 +286,7 @@ export interface AiAgentRequest {
 }
 
 export interface AiChatStreamStartResponse {
+  user_message: AiChatMessage;
   stream_id: string;
   session_id: string;
   user_message_id: string;
@@ -283,6 +307,7 @@ export interface AiChatStreamEvent {
   tool_output?: AiToolOutputEvent | null;
   background_task?: AiBackgroundTaskEvent | null;
   file_changes?: AiFileChangeSummary[] | null;
+  injection?: AiMessageInjectionEvent | null;
 }
 
 export interface AiToolOutputEvent {

@@ -853,6 +853,7 @@ export function WorkspaceShell() {
   const {
     reset,
     settings,
+    updateAi,
     updateAppearance,
     updateBasic,
     updateCommand,
@@ -2352,6 +2353,7 @@ export function WorkspaceShell() {
           recentCommands: commandHistoryEntries,
           recentTerminalOutput: activeAiRecentTerminalOutput,
           sendShortcutBinding: aiSendMessageShortcutBinding,
+          runningSendBehavior: settings.ai.runningSendBehavior,
           terminalDirectory: activeAiTerminalDirectory,
           terminalSessionId: activeAiTerminalTab?.sessionId ?? null,
           terminalTitle: activeAiTerminalTitle,
@@ -10523,6 +10525,7 @@ export function WorkspaceShell() {
             onReturnWorkspace={returnFromSettings}
             onSaveCredential={saveCredentialFromSettings}
             onUpdateAppearance={updateAppearance}
+            onUpdateAi={updateAi}
             onUpdateBasic={updateBasic}
             onUpdateCommand={updateCommand}
             onUpdateFileTransfer={updateFileTransfer}

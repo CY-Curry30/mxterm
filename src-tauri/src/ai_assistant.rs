@@ -414,6 +414,16 @@ pub struct AiChatStreamStartRequest {
     pub host_scope: Option<String>,
     #[serde(default)]
     pub connection_id: Option<String>,
+    #[serde(default)]
+    pub client_ids: Option<AiChatClientIds>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AiChatClientIds {
+    pub stream_id: String,
+    pub session_id: String,
+    pub user_message_id: String,
+    pub assistant_message_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -468,11 +478,79 @@ pub struct AiChatStreamStartResponse {
     pub session_id: String,
     pub user_message_id: String,
     pub assistant_message_id: String,
+    pub user_message: AiChatMessage,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AiChatStreamStopRequest {
     pub stream_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AiChatStreamEnqueueRequest {
+    pub stream_id: String,
+    pub queue_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub contexts: Vec<AiContextBlock>,
+}
+
+pub(crate) struct PreparedUserInjection {
+    pub queue_id: String,
+    pub user_message: AiChatMessage,
+    pub model_message: AiModelMessage,
+}
+
+/// Closing and accepting use the same lock, so a final model response cannot
+/// silently abandon an insertion that the UI has already been told was accepted.
+pub(crate) struct AgentMessageInbox {
+    closed: bool,
+    pending: Vec<PreparedUserInjection>,
+    committed: HashMap<String, Arc<crate::events::AiMessageInjectionEvent>>,
+    preemption: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for AgentMessageInbox {
+    fn default() -> Self {
+        Self {
+            closed: false,
+            pending: Vec::new(),
+            committed: HashMap::new(),
+            preemption: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+impl AgentMessageInbox {
+    fn enqueue(&mut self, message: PreparedUserInjection) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.pending.push(message);
+        // Keep the request latched until consumption, including when the run
+        // is between awaits. A notification alone can lose that boundary race.
+        self.preemption.send_replace(true);
+        true
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.preemption.subscribe()
+    }
+
+    pub(crate) fn take(&mut self, finish_if_empty: bool) -> Vec<PreparedUserInjection> {
+        if finish_if_empty && self.pending.is_empty() {
+            self.closed = true;
+        }
+        self.preemption.send_replace(false);
+        std::mem::take(&mut self.pending)
+    }
+
+    pub(crate) fn record_commit(&mut self, injection: &crate::events::AiMessageInjectionEvent) {
+        let receipt = Arc::new(injection.clone());
+        for id in &injection.queue_ids {
+            self.committed.insert(id.clone(), receipt.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -505,15 +583,21 @@ pub struct AiChatStreamManager {
 
 struct AiChatStreamHandle {
     session_id: String,
-    message_id: String,
-    content: Arc<StdMutex<String>>,
-    thinking: Arc<StdMutex<String>>,
-    tool_calls: Arc<StdMutex<Vec<AiToolCallRecord>>>,
+    current_message: Arc<StdMutex<AiActiveMessage>>,
     approvals: PendingApprovals,
     user_inputs: PendingUserInputs,
-    emitter: StreamEmitter,
+    inbox: Option<Arc<StdMutex<AgentMessageInbox>>>,
+    attachment_char_budget: usize,
     stopped: Arc<AtomicBool>,
     task: JoinHandle<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AiActiveMessage {
+    pub content: Arc<StdMutex<String>>,
+    pub thinking: Arc<StdMutex<String>>,
+    pub tool_calls: Arc<StdMutex<Vec<AiToolCallRecord>>>,
+    pub emitter: StreamEmitter,
 }
 
 struct PreparedAiStream {
@@ -535,6 +619,24 @@ pub(crate) struct StreamEmitter {
 }
 
 impl StreamEmitter {
+    pub(crate) fn for_message(&self, message_id: String) -> Self {
+        Self {
+            message_id,
+            active: Arc::new(AtomicBool::new(true)),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn complete_message(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn injected(&self, injection: crate::events::AiMessageInjectionEvent) {
+        self.emit(AiChatStreamEvent {
+            injection: Some(injection),
+            ..self.event("message_injected")
+        });
+    }
     pub(crate) fn audit(&self, record: &AiToolCallRecord) -> Result<(), AppError> {
         crate::ai_audit::append(&self.app, &self.session_id, &self.message_id, record)
     }
@@ -561,6 +663,7 @@ impl StreamEmitter {
             tool_output: None,
             background_task: None,
             file_changes: None,
+            injection: None,
         }
     }
 
@@ -674,7 +777,8 @@ impl AiChatStreamManager {
         }
     }
 
-    async fn start(&self, app: AppHandle, mut prepared: PreparedAiStream) -> Result<(), AppError> {
+    async fn start(&self, app: AppHandle, prepared: PreparedAiStream) -> Result<(), AppError> {
+        let attachment_char_budget = model_attachment_char_budget(&prepared.config);
         let stream_id = prepared.response.stream_id.clone();
         let session_id = prepared.response.session_id.clone();
         let message_id = prepared.response.assistant_message_id.clone();
@@ -686,18 +790,6 @@ impl AiChatStreamManager {
             message_id: message_id.clone(),
             active,
         };
-        // Resolve the implicit SSH `~` to an absolute home directory before
-        // file tools validate paths or build their workspace cache key.
-        if let Some(agent) = prepared.agent.as_mut() {
-            if let Err(error) = self.ensure_remote_workspace(&app, agent).await {
-                let message = user_visible_ai_error(&error);
-                let _ =
-                    update_assistant_message(&app, &session_id, &message_id, "", "", "error", &[]);
-                emitter.failed(String::new(), message);
-                return Ok(());
-            }
-        }
-
         let content = Arc::new(StdMutex::new(String::new()));
         let thinking = Arc::new(StdMutex::new(String::new()));
         let tool_calls = Arc::new(StdMutex::new(Vec::new()));
@@ -712,119 +804,119 @@ impl AiChatStreamManager {
         let task_user_inputs = Arc::clone(&user_inputs);
         let task_stopped = Arc::clone(&stopped);
         let task_tasks = Arc::clone(&self.tasks);
-        let workspace_scope = prepared
+        let inbox = prepared
             .agent
             .as_ref()
-            .map(ai_agent::workspace_scope_key)
-            .unwrap_or_else(|| "none".to_string());
-        let workspace_cache_key = format!("{session_id}\n{workspace_scope}");
-        let (task_workspace_state, should_hydrate_workspace_state) = {
-            let mut states = self.workspace_states.lock().await;
-            if let Some(state) = states.get(&workspace_cache_key) {
-                (state.clone(), false)
-            } else {
-                let state = Arc::new(AsyncMutex::new(Default::default()));
-                states.insert(workspace_cache_key.clone(), state.clone());
-                (state, true)
+            .map(|_| Arc::new(StdMutex::new(AgentMessageInbox::default())));
+        let task_inbox = inbox.clone();
+        let current_message = Arc::new(StdMutex::new(AiActiveMessage {
+            content: content.clone(),
+            thinking: thinking.clone(),
+            tool_calls: tool_calls.clone(),
+            emitter: emitter.clone(),
+        }));
+        let task_current_message = current_message.clone();
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+        let task_emitter = emitter.clone();
+        let task_session_id = session_id.clone();
+
+        let task = tokio::spawn(async move {
+            let mut prepared = prepared;
+            if registered_rx.await.is_err() {
+                return;
             }
-        };
-        if should_hydrate_workspace_state {
-            let restored =
-                crate::storage_sqlite::get_ai_workspace_state(&app, &session_id, &workspace_scope)
-                    .and_then(|json| {
-                        json.map(|json| {
-                            serde_json::from_str::<ai_agent::WorkspaceState>(&json).map_err(
-                                |error| {
+            let result = async {
+                let (task_workspace_state, workspace_scope) = manager
+                    .prepare_workspace(&app, &task_session_id, &mut prepared.agent)
+                    .await?;
+                let PreparedAiStream {
+                    config,
+                    api_key,
+                    messages,
+                    agent,
+                    reasoning_level,
+                    ..
+                } = prepared;
+                match agent.as_ref() {
+                    Some(agent) => {
+                        let mut run = AgentRun {
+                            app: &app,
+                            provider: &config,
+                            api_key: &api_key,
+                            agent,
+                            pool: &manager.exec_pool,
+                            stopped: Arc::clone(&task_stopped),
+                            content: Arc::clone(&task_content),
+                            thinking: Arc::clone(&task_thinking),
+                            tool_calls: Arc::clone(&task_tool_calls),
+                            approvals: Arc::clone(&task_approvals),
+                            user_inputs: Arc::clone(&task_user_inputs),
+                            emitter: task_emitter.clone(),
+                            current_message: task_current_message.clone(),
+                            inbox: task_inbox.clone().expect("agent inbox"),
+                            preemption: task_inbox
+                                .as_ref()
+                                .expect("agent inbox")
+                                .lock()
+                                .map_err(|error| {
                                     AppError::new(
-                                        "ai_file_history_invalid",
-                                        "读取文件修改记录失败，已停止 Agent。",
+                                        "ai_inbox_failed",
+                                        "读取消息队列失败。",
                                         error,
                                         true,
                                     )
-                                },
-                            )
-                        })
-                        .transpose()
-                    });
-            match restored {
-                Ok(Some(restored)) => *task_workspace_state.lock().await = restored,
-                Ok(None) => {}
-                Err(error) => {
-                    self.workspace_states
-                        .lock()
+                                })?
+                                .subscribe(),
+                            attachments: agent.attachments.clone(),
+                            pending_separator: AtomicBool::new(false),
+                            reasoning_level: reasoning_level.as_deref(),
+                            files: task_workspace_state,
+                            workspace_scope,
+                            message_persist_failed: AtomicBool::new(false),
+                            audit_failed: AtomicBool::new(false),
+                            tasks: Arc::clone(&task_tasks),
+                        };
+                        ai_agent::run_agent(&mut run, messages).await
+                    }
+                    None => {
+                        run_provider_stream(
+                            &config,
+                            &api_key,
+                            reasoning_level.as_deref(),
+                            messages,
+                            Arc::clone(&task_stopped),
+                            |delta| {
+                                if delta.is_empty() {
+                                    return;
+                                }
+                                if let Ok(mut current) = task_content.lock() {
+                                    current.push_str(&delta);
+                                }
+                                task_emitter.chunk(delta);
+                            },
+                            |delta| {
+                                if delta.is_empty() {
+                                    return;
+                                }
+                                if let Ok(mut current) = task_thinking.lock() {
+                                    current.push_str(&delta);
+                                }
+                                task_emitter.thinking(delta);
+                            },
+                        )
                         .await
-                        .remove(&workspace_cache_key);
-                    update_assistant_message(&app, &session_id, &message_id, "", "", "error", &[])?;
-                    emitter.failed(String::new(), user_visible_ai_error(&error));
-                    return Ok(());
+                    }
                 }
             }
-        }
-        let task_emitter = emitter.clone();
-
-        let task = tokio::spawn(async move {
-            let PreparedAiStream {
-                config,
-                api_key,
-                messages,
-                agent,
-                reasoning_level,
-                ..
-            } = prepared;
-            let result = match agent.as_ref() {
-                Some(agent) => {
-                    let run = AgentRun {
-                        app: &app,
-                        provider: &config,
-                        api_key: &api_key,
-                        agent,
-                        pool: &manager.exec_pool,
-                        stopped: Arc::clone(&task_stopped),
-                        content: Arc::clone(&task_content),
-                        thinking: Arc::clone(&task_thinking),
-                        tool_calls: Arc::clone(&task_tool_calls),
-                        approvals: Arc::clone(&task_approvals),
-                        user_inputs: Arc::clone(&task_user_inputs),
-                        emitter: &task_emitter,
-                        pending_separator: AtomicBool::new(false),
-                        reasoning_level: reasoning_level.as_deref(),
-                        files: task_workspace_state,
-                        workspace_scope,
-                        message_persist_failed: AtomicBool::new(false),
-                        audit_failed: AtomicBool::new(false),
-                        tasks: Arc::clone(&task_tasks),
-                    };
-                    ai_agent::run_agent(&run, messages).await
-                }
-                None => {
-                    run_provider_stream(
-                        &config,
-                        &api_key,
-                        reasoning_level.as_deref(),
-                        messages,
-                        Arc::clone(&task_stopped),
-                        |delta| {
-                            if delta.is_empty() {
-                                return;
-                            }
-                            if let Ok(mut current) = task_content.lock() {
-                                current.push_str(&delta);
-                            }
-                            task_emitter.chunk(delta);
-                        },
-                        |delta| {
-                            if delta.is_empty() {
-                                return;
-                            }
-                            if let Ok(mut current) = task_thinking.lock() {
-                                current.push_str(&delta);
-                            }
-                            task_emitter.thinking(delta);
-                        },
-                    )
-                    .await
-                }
-            };
+            .await;
+            let current = task_current_message
+                .lock()
+                .expect("current message")
+                .clone();
+            let task_content = current.content;
+            let task_thinking = current.thinking;
+            let task_tool_calls = current.tool_calls;
+            let task_emitter = current.emitter;
 
             if task_stopped.load(Ordering::SeqCst) {
                 let final_content = strip_tool_call_summary(locked_string(&task_content));
@@ -867,12 +959,11 @@ impl AiChatStreamManager {
                 manager.finish_stream(&task_emitter.stream_id).await;
                 return;
             }
+            manager.finish_stream(&task_emitter.stream_id).await;
             match error {
                 None => task_emitter.finished(final_content),
                 Some(error) => task_emitter.failed(final_content, error),
             }
-
-            manager.finish_stream(&task_emitter.stream_id).await;
         });
 
         let previous = {
@@ -881,21 +972,77 @@ impl AiChatStreamManager {
                 stream_id,
                 AiChatStreamHandle {
                     session_id,
-                    message_id,
-                    content,
-                    thinking,
-                    tool_calls,
+                    current_message,
                     approvals,
                     user_inputs,
-                    emitter,
+                    inbox,
+                    attachment_char_budget,
                     stopped,
                     task,
                 },
             )
         };
         close_stream_handle(previous);
+        let _ = registered_tx.send(());
 
         Ok(())
+    }
+
+    async fn prepare_workspace(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        agent: &mut Option<PreparedAgent>,
+    ) -> Result<(Arc<AsyncMutex<ai_agent::WorkspaceState>>, String), AppError> {
+        if let Some(agent) = agent.as_mut() {
+            self.ensure_remote_workspace(app, agent).await?;
+        }
+        let workspace_scope = agent
+            .as_ref()
+            .map(ai_agent::workspace_scope_key)
+            .unwrap_or_else(|| "none".to_string());
+        let workspace_cache_key = format!("{session_id}\n{workspace_scope}");
+        let (task_workspace_state, should_hydrate_workspace_state) = {
+            let mut states = self.workspace_states.lock().await;
+            if let Some(state) = states.get(&workspace_cache_key) {
+                (state.clone(), false)
+            } else {
+                let state = Arc::new(AsyncMutex::new(Default::default()));
+                states.insert(workspace_cache_key.clone(), state.clone());
+                (state, true)
+            }
+        };
+        if should_hydrate_workspace_state {
+            let restored =
+                crate::storage_sqlite::get_ai_workspace_state(app, session_id, &workspace_scope)
+                    .and_then(|json| {
+                        json.map(|json| {
+                            serde_json::from_str::<ai_agent::WorkspaceState>(&json).map_err(
+                                |error| {
+                                    AppError::new(
+                                        "ai_file_history_invalid",
+                                        "读取文件修改记录失败，已停止 Agent。",
+                                        error,
+                                        true,
+                                    )
+                                },
+                            )
+                        })
+                        .transpose()
+                    });
+            match restored {
+                Ok(Some(restored)) => *task_workspace_state.lock().await = restored,
+                Ok(None) => {}
+                Err(error) => {
+                    self.workspace_states
+                        .lock()
+                        .await
+                        .remove(&workspace_cache_key);
+                    return Err(error);
+                }
+            }
+        }
+        Ok((task_workspace_state, workspace_scope))
     }
 
     async fn decide_tool_call(&self, request: AiChatToolDecisionRequest) -> Result<(), AppError> {
@@ -945,10 +1092,15 @@ impl AiChatStreamManager {
             let Some(handle) = streams.get(stream_id) else {
                 return Ok(());
             };
-            (
-                Arc::clone(&handle.user_inputs),
-                Arc::clone(&handle.tool_calls),
-            )
+            let tool_calls = handle
+                .current_message
+                .lock()
+                .map_err(|error| {
+                    AppError::new("ai_stream_state_failed", "读取当前回复失败。", error, true)
+                })?
+                .tool_calls
+                .clone();
+            (Arc::clone(&handle.user_inputs), tool_calls)
         };
 
         if !request.cancelled && option_id.is_none() && text.is_none() {
@@ -1012,6 +1164,7 @@ impl AiChatStreamManager {
         app: &AppHandle,
         request: AiChatStreamStopRequest,
     ) -> Result<(), AppError> {
+        let _operation = self.operation_lock.lock().await;
         let stream_id = require_non_empty(
             &request.stream_id,
             "ai_stream_missing",
@@ -1023,19 +1176,27 @@ impl AiChatStreamManager {
         };
         handle.stopped.store(true, Ordering::SeqCst);
         handle.task.abort();
-        let content = locked_string(&handle.content);
-        let thinking = locked_string(&handle.thinking);
-        let tool_calls = settle_tool_calls(&handle.tool_calls, &handle.emitter);
+        let current = handle
+            .current_message
+            .lock()
+            .map_err(|error| {
+                AppError::new("ai_stream_state_failed", "读取当前回复失败。", error, true)
+            })?
+            .clone();
+        let content = strip_tool_call_summary(locked_string(&current.content));
+        let thinking = locked_string(&current.thinking);
+        let emitter = current.emitter;
+        let tool_calls = settle_tool_calls(&current.tool_calls, &emitter);
         let _ = update_assistant_message(
             app,
             &handle.session_id,
-            &handle.message_id,
+            emitter.message_id(),
             &content,
             &thinking,
             "stopped",
             &tool_calls,
         );
-        handle.emitter.stopped(content);
+        emitter.stopped(content);
         Ok(())
     }
 
@@ -1345,10 +1506,126 @@ pub async fn ai_chat_stream_start(
     request: AiChatStreamStartRequest,
 ) -> Result<AiChatStreamStartResponse, AppError> {
     let _operation = manager.operation_lock.lock().await;
+    if let Some(session_id) = request.session_id.as_deref() {
+        if manager
+            .streams
+            .lock()
+            .await
+            .values()
+            .any(|stream| stream.session_id == session_id)
+        {
+            return Err(AppError::new(
+                "ai_session_busy",
+                "当前会话仍在运行，请先停止或将消息加入队列。",
+                "active stream exists",
+                true,
+            ));
+        }
+    }
     let prepared = prepare_stream(&app, request)?;
     let response = prepared.response.clone();
     manager.start(app, prepared).await?;
     Ok(response)
+}
+
+#[tauri::command]
+pub async fn ai_chat_stream_enqueue(
+    app: AppHandle,
+    manager: State<'_, AiChatStreamManager>,
+    request: AiChatStreamEnqueueRequest,
+) -> Result<(), AppError> {
+    // Stop/start/delete use the same operation lock. Preparation cannot race
+    // session deletion, and closure is checked again after attachment validation.
+    let _operation = manager.operation_lock.lock().await;
+    let (session_id, inbox, budget, emitter) = {
+        let streams = manager.streams.lock().await;
+        let handle = streams
+            .get(&request.stream_id)
+            .ok_or_else(injection_closed_error)?;
+        let inbox = handle.inbox.clone().ok_or_else(|| {
+            AppError::new(
+                "ai_injection_unavailable",
+                "对话模式仅支持排队发送。",
+                "agent stream required",
+                true,
+            )
+        })?;
+        let emitter = handle
+            .current_message
+            .lock()
+            .map_err(|error| AppError::new("ai_inbox_failed", "读取当前回复失败。", error, true))?
+            .emitter
+            .clone();
+        (
+            handle.session_id.clone(),
+            inbox,
+            handle.attachment_char_budget,
+            emitter,
+        )
+    };
+    let mut pending = inbox
+        .lock()
+        .map_err(|error| AppError::new("ai_inbox_failed", "读取消息队列失败。", error, true))?;
+    let queue_id = validated_client_id(&request.queue_id)?;
+    // The UUID is also the persisted user-message ID. Keep its committed
+    // receipt after consumption so a lost acknowledgement cannot re-enqueue it.
+    if let Some(receipt) = pending.committed.get(&queue_id) {
+        emitter
+            .for_message(receipt.previous_message.id.clone())
+            .injected((**receipt).clone());
+        return Ok(());
+    }
+    if pending.closed {
+        return Err(injection_closed_error());
+    }
+    if pending.pending.iter().any(|item| item.queue_id == queue_id) {
+        return Ok(());
+    }
+    let content = request.content.trim().to_string();
+    let normalized = normalize_context_blocks(request.contexts)?;
+    if content.is_empty() && normalized.is_empty() {
+        return Err(AppError::new(
+            "ai_message_missing",
+            "请输入问题或添加附件。",
+            "blank insertion",
+            true,
+        ));
+    }
+    let contexts = persist_context_artifacts(&app, &session_id, normalized)?;
+    let now = now_timestamp()?;
+    let model_message = AiModelMessage {
+        role: "user".into(),
+        content: format_user_message_for_model(&content, &contexts, budget),
+        images: image_attachments_from_contexts_for_session(&app, &session_id, &contexts)?,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    };
+    let user_message = empty_chat_message(queue_id.clone(), &session_id, "user", &now);
+    pending.enqueue(PreparedUserInjection {
+        queue_id,
+        user_message: AiChatMessage {
+            content,
+            contexts,
+            ..user_message
+        },
+        model_message,
+    });
+    Ok(())
+}
+
+fn injection_closed_error() -> AppError {
+    AppError::new(
+        "ai_injection_closed",
+        "本轮已结束，消息仍保留在队列中。",
+        "inbox closed",
+        true,
+    )
+}
+
+fn validated_client_id(id: &str) -> Result<String, AppError> {
+    Uuid::parse_str(id)
+        .map(|id| id.to_string())
+        .map_err(|error| AppError::new("ai_client_id_invalid", "消息标识无效。", error, true))
 }
 
 #[tauri::command]
@@ -1533,9 +1810,24 @@ fn prepare_stream(
     )?
     .to_string();
     let now = now_timestamp()?;
-    let stream_id = Uuid::new_v4().to_string();
-    let user_message_id = Uuid::new_v4().to_string();
-    let assistant_message_id = Uuid::new_v4().to_string();
+    let stream_id = request
+        .client_ids
+        .as_ref()
+        .map(|ids| validated_client_id(&ids.stream_id))
+        .transpose()?
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let user_message_id = request
+        .client_ids
+        .as_ref()
+        .map(|ids| validated_client_id(&ids.user_message_id))
+        .transpose()?
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let assistant_message_id = request
+        .client_ids
+        .as_ref()
+        .map(|ids| validated_client_id(&ids.assistant_message_id))
+        .transpose()?
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let repository = StorageRepository::open_app(app)?;
     let mut config = load_stored_provider_config(&repository, &provider_config_id)?
         .ok_or_else(ai_provider_config_missing)?;
@@ -1558,7 +1850,12 @@ fn prepare_stream(
         ensure_chat_session_exists(&repository, existing_id)?;
         existing_id.to_string()
     } else {
-        Uuid::new_v4().to_string()
+        request
+            .client_ids
+            .as_ref()
+            .map(|ids| validated_client_id(&ids.session_id))
+            .transpose()?
+            .unwrap_or_else(|| Uuid::new_v4().to_string())
     };
 
     let normalized_contexts = normalize_context_blocks(request.contexts)?;
@@ -1571,37 +1868,6 @@ fn prepare_stream(
             true,
         ));
     }
-    if is_new_session {
-        repository
-            .sqlite_connection()
-            .execute(
-                "INSERT INTO ai_chat_sessions(id, title, provider_config_id, host_scope, connection_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                params![
-                    session_id,
-                    if user_content.is_empty() {
-                        "附件消息".to_string()
-                    } else {
-                        chat_title_from_content(&user_content)
-                    },
-                    provider_config_id,
-                    host_scope,
-                    session_connection_id,
-                    now,
-                ],
-            )
-            .map_err(sqlite_ai_error)?;
-    } else {
-        repository
-            .sqlite_connection()
-            .execute(
-                "UPDATE ai_chat_sessions
-                    SET provider_config_id = ?2, updated_at = ?3
-                  WHERE id = ?1",
-                params![session_id, provider_config_id, now],
-            )
-            .map_err(sqlite_ai_error)?;
-    }
     let mut agent = request
         .agent
         .map(|agent| prepare_agent(app, agent))
@@ -1611,7 +1877,6 @@ fn prepare_stream(
     } else {
         &normalized_contexts
     };
-
     let previous_messages = list_chat_messages(&repository, &session_id)?;
     if let Some(agent) = agent.as_mut() {
         agent.attachments = previous_messages
@@ -1621,40 +1886,6 @@ fn prepare_stream(
             .filter(|block| block.artifact_id.is_some())
             .collect();
     }
-    insert_chat_message(
-        &repository,
-        InsertChatMessage {
-            id: &user_message_id,
-            session_id: &session_id,
-            role: "user",
-            content: &user_content,
-            contexts: &contexts,
-            commands: &[],
-            status: "complete",
-            now: &now,
-        },
-    )?;
-    insert_chat_message(
-        &repository,
-        InsertChatMessage {
-            id: &assistant_message_id,
-            session_id: &session_id,
-            role: "assistant",
-            content: "",
-            contexts: &[],
-            commands: &[],
-            status: "streaming",
-            now: &now,
-        },
-    )?;
-    repository
-        .sqlite_connection()
-        .execute(
-            "UPDATE ai_chat_sessions SET updated_at = ?2 WHERE id = ?1",
-            params![session_id, now],
-        )
-        .map_err(sqlite_ai_error)?;
-
     let attachment_char_budget = model_attachment_char_budget(&config);
     let mut model_messages = model_messages_from_history_with_budget_for_session(
         app,
@@ -1673,6 +1904,71 @@ fn prepare_stream(
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
+    // Complete validation before writing history. The start command either
+    // commits both messages or rejects without leaving a phantom running reply.
+    let tx = repository
+        .sqlite_connection()
+        .unchecked_transaction()
+        .map_err(sqlite_ai_error)?;
+    if is_new_session {
+        tx.execute(
+                "INSERT INTO ai_chat_sessions(id, title, provider_config_id, host_scope, connection_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![
+                    session_id,
+                    if user_content.is_empty() {
+                        "附件消息".to_string()
+                    } else {
+                        chat_title_from_content(&user_content)
+                    },
+                    provider_config_id,
+                    host_scope,
+                    session_connection_id,
+                    now,
+                ],
+            )
+            .map_err(sqlite_ai_error)?;
+    } else {
+        tx.execute(
+            "UPDATE ai_chat_sessions
+                    SET provider_config_id = ?2, updated_at = ?3
+                  WHERE id = ?1",
+            params![session_id, provider_config_id, now],
+        )
+        .map_err(sqlite_ai_error)?;
+    }
+    insert_chat_message_on(
+        &tx,
+        InsertChatMessage {
+            id: &user_message_id,
+            session_id: &session_id,
+            role: "user",
+            content: &user_content,
+            contexts: &contexts,
+            commands: &[],
+            status: "complete",
+            now: &now,
+        },
+    )?;
+    insert_chat_message_on(
+        &tx,
+        InsertChatMessage {
+            id: &assistant_message_id,
+            session_id: &session_id,
+            role: "assistant",
+            content: "",
+            contexts: &[],
+            commands: &[],
+            status: "streaming",
+            now: &now,
+        },
+    )?;
+    tx.commit().map_err(sqlite_ai_error)?;
+    let user_message = AiChatMessage {
+        content: user_content,
+        contexts,
+        ..empty_chat_message(user_message_id.clone(), &session_id, "user", &now)
+    };
 
     Ok(PreparedAiStream {
         config,
@@ -1685,6 +1981,7 @@ fn prepare_stream(
             session_id,
             user_message_id,
             assistant_message_id,
+            user_message,
         },
     })
 }
@@ -2790,11 +3087,16 @@ fn insert_chat_message(
     repository: &StorageRepository,
     input: InsertChatMessage<'_>,
 ) -> Result<(), AppError> {
+    insert_chat_message_on(repository.sqlite_connection(), input)
+}
+
+fn insert_chat_message_on(
+    connection: &rusqlite::Connection,
+    input: InsertChatMessage<'_>,
+) -> Result<(), AppError> {
     let contexts_json = serde_json::to_string(input.contexts).map_err(json_ai_error)?;
     let commands_json = serde_json::to_string(input.commands).map_err(json_ai_error)?;
-    repository
-        .sqlite_connection()
-        .execute(
+    connection.execute(
             "INSERT INTO ai_chat_messages(
                 id, session_id, role, content, contexts_json, commands_json, status, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
@@ -2811,6 +3113,137 @@ fn insert_chat_message(
         )
         .map_err(sqlite_ai_error)?;
     Ok(())
+}
+
+pub(crate) fn empty_chat_message(
+    id: String,
+    session_id: &str,
+    role: &str,
+    now: &str,
+) -> AiChatMessage {
+    AiChatMessage {
+        id,
+        session_id: session_id.into(),
+        role: role.into(),
+        content: String::new(),
+        thinking: String::new(),
+        contexts: Vec::new(),
+        commands: Vec::new(),
+        tool_calls: Vec::new(),
+        file_changes: Vec::new(),
+        status: if role == "assistant" {
+            "streaming"
+        } else {
+            "complete"
+        }
+        .into(),
+        created_at: now.into(),
+        updated_at: now.into(),
+    }
+}
+
+/// Persist the old reply and new message boundary together. Events are sent
+/// only after commit; a failed insert cannot produce a fabricated history row.
+pub(crate) fn persist_message_injection(
+    app: &AppHandle,
+    emitter: &StreamEmitter,
+    content: &str,
+    thinking: &str,
+    tool_calls: &[AiToolCallRecord],
+    pending: &mut [PreparedUserInjection],
+    interrupted: bool,
+) -> Result<crate::events::AiMessageInjectionEvent, AppError> {
+    let repository = StorageRepository::open_app(app)?;
+    let now = now_timestamp()?;
+    let mut previous_message = list_chat_messages(&repository, emitter.session_id())?
+        .into_iter()
+        .find(|message| message.id == emitter.message_id())
+        .ok_or_else(|| {
+            AppError::new(
+                "ai_message_missing",
+                "插入消息时找不到原回复。",
+                "previous reply missing",
+                true,
+            )
+        })?;
+    previous_message.content = content.into();
+    previous_message.thinking = thinking.into();
+    previous_message.tool_calls = tool_calls.to_vec();
+    previous_message.commands = extract_command_suggestions(content);
+    previous_message.file_changes =
+        ai_agent::file_history::persisted_summaries(app, emitter.session_id())?
+            .into_iter()
+            .filter(|summary| summary.message_id == emitter.message_id())
+            .collect();
+    previous_message.status = if interrupted { "stopped" } else { "complete" }.into();
+    previous_message.updated_at = now;
+    commit_message_injection(&repository, previous_message, pending)
+}
+
+fn commit_message_injection(
+    repository: &StorageRepository,
+    previous_message: AiChatMessage,
+    pending: &mut [PreparedUserInjection],
+) -> Result<crate::events::AiMessageInjectionEvent, AppError> {
+    let now = &previous_message.updated_at;
+    let session_id = &previous_message.session_id;
+    let assistant = empty_chat_message(Uuid::new_v4().to_string(), session_id, "assistant", now);
+    let tx = repository
+        .sqlite_connection()
+        .unchecked_transaction()
+        .map_err(sqlite_ai_error)?;
+    tx.execute(
+        "UPDATE ai_chat_messages SET content=?2, thinking=?3, tool_calls_json=?4, commands_json=?5, status=?8, updated_at=?6 WHERE id=?1 AND session_id=?7",
+        params![previous_message.id, previous_message.content, previous_message.thinking,
+            serde_json::to_string(&previous_message.tool_calls).map_err(json_ai_error)?,
+            serde_json::to_string(&previous_message.commands).map_err(json_ai_error)?, now, session_id, previous_message.status],
+    ).map_err(sqlite_ai_error)?;
+    for item in pending.iter_mut() {
+        item.user_message.created_at = now.clone();
+        item.user_message.updated_at = now.clone();
+        let user = &item.user_message;
+        insert_chat_message_on(
+            &tx,
+            InsertChatMessage {
+                id: &user.id,
+                session_id: &user.session_id,
+                role: "user",
+                content: &user.content,
+                contexts: &user.contexts,
+                commands: &[],
+                status: "complete",
+                now,
+            },
+        )?;
+    }
+    insert_chat_message_on(
+        &tx,
+        InsertChatMessage {
+            id: &assistant.id,
+            session_id: &assistant.session_id,
+            role: "assistant",
+            content: "",
+            contexts: &[],
+            commands: &[],
+            status: "streaming",
+            now,
+        },
+    )?;
+    tx.execute(
+        "UPDATE ai_chat_sessions SET updated_at=?2 WHERE id=?1",
+        params![session_id, now],
+    )
+    .map_err(sqlite_ai_error)?;
+    tx.commit().map_err(sqlite_ai_error)?;
+    Ok(crate::events::AiMessageInjectionEvent {
+        queue_ids: pending.iter().map(|item| item.queue_id.clone()).collect(),
+        previous_message,
+        user_messages: pending
+            .iter()
+            .map(|item| item.user_message.clone())
+            .collect(),
+        assistant_message: assistant,
+    })
 }
 
 // Early versions marked previews as pending even though no approval receiver
@@ -3130,7 +3563,7 @@ fn format_tool_history_result(call: &AiToolCallRecord) -> String {
     result
 }
 
-fn strip_tool_call_summary(content: String) -> String {
+pub(crate) fn strip_tool_call_summary(content: String) -> String {
     const MARKER: &str = "[本轮工具调用记录]";
     let Some(start) = content.find(MARKER) else {
         return content;
@@ -4725,7 +5158,7 @@ fn chat_title_from_content(content: &str) -> String {
     }
 }
 
-fn locked_string(value: &Arc<StdMutex<String>>) -> String {
+pub(crate) fn locked_string(value: &Arc<StdMutex<String>>) -> String {
     value
         .lock()
         .map(|content| content.clone())
@@ -4944,6 +5377,182 @@ mod tests {
 
     use super::*;
     use crate::storage_vault::{InMemorySecretStore, SecretStore};
+
+    fn prepared_injection(id: &str, session_id: &str) -> PreparedUserInjection {
+        let mut user_message = empty_chat_message(id.into(), session_id, "user", "1000");
+        user_message.content = format!("follow-up {id}");
+        PreparedUserInjection {
+            queue_id: id.into(),
+            model_message: AiModelMessage {
+                role: "user".into(),
+                content: user_message.content.clone(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            user_message,
+        }
+    }
+
+    #[test]
+    fn message_inbox_closes_only_after_all_accepted_messages_are_consumed() {
+        let mut inbox = AgentMessageInbox::default();
+        assert!(inbox.take(false).is_empty());
+        assert!(!inbox.closed);
+        assert!(inbox.enqueue(prepared_injection("first", "session")));
+        assert!(inbox.enqueue(prepared_injection("second", "session")));
+        let messages = inbox.take(true);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|item| item.queue_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(!inbox.closed);
+        assert!(inbox.take(true).is_empty());
+        assert!(inbox.closed);
+        assert!(!inbox.enqueue(prepared_injection("late", "session")));
+    }
+
+    #[test]
+    fn message_inbox_preemption_is_latched_for_late_subscribers_and_reset_at_consumption() {
+        let mut inbox = AgentMessageInbox::default();
+        assert!(inbox.enqueue(prepared_injection("first", "session")));
+        let signal = inbox.subscribe();
+        assert!(*signal.borrow());
+        assert_eq!(inbox.take(false).len(), 1);
+        assert!(!*signal.borrow());
+        assert!(inbox.enqueue(prepared_injection("second", "session")));
+        assert!(*signal.borrow());
+        assert_eq!(inbox.take(false).len(), 1);
+        assert!(!*signal.borrow());
+        inbox.take(true);
+        assert!(!inbox.enqueue(prepared_injection("late", "session")));
+        assert!(!*signal.borrow());
+    }
+
+    #[test]
+    fn message_inbox_preserves_committed_receipts_after_the_final_request() {
+        let mut inbox = AgentMessageInbox::default();
+        let receipt = crate::events::AiMessageInjectionEvent {
+            queue_ids: vec!["first".into(), "second".into()],
+            previous_message: empty_chat_message("old".into(), "session", "assistant", "1000"),
+            user_messages: vec![
+                prepared_injection("first", "session").user_message,
+                prepared_injection("second", "session").user_message,
+            ],
+            assistant_message: empty_chat_message("new".into(), "session", "assistant", "1001"),
+        };
+        inbox.record_commit(&receipt);
+        inbox.take(true);
+        let first = inbox.committed.get("first").unwrap();
+        let second = inbox.committed.get("second").unwrap();
+        assert!(Arc::ptr_eq(first, second));
+        assert_eq!(first.assistant_message.id, "new");
+        assert_eq!(first.user_messages.len(), 2);
+        assert!(inbox.pending.is_empty());
+    }
+
+    fn injection_repository(name: &str) -> (StorageRepository, AiChatMessage) {
+        let (repository, _) = temp_repository(name);
+        repository.sqlite_connection().execute(
+            "INSERT INTO ai_chat_sessions(id, title, created_at, updated_at) VALUES ('session-injection', 'demo', '1000', '1000')", [],
+        ).unwrap();
+        insert_chat_message(
+            &repository,
+            InsertChatMessage {
+                id: "old-reply",
+                session_id: "session-injection",
+                role: "assistant",
+                content: "partial",
+                contexts: &[],
+                commands: &[],
+                status: "streaming",
+                now: "1000",
+            },
+        )
+        .unwrap();
+        let mut previous = list_chat_messages(&repository, "session-injection")
+            .unwrap()
+            .remove(0);
+        previous.content = "finished tool output".into();
+        previous.thinking = "reasoning".into();
+        previous.status = "complete".into();
+        previous.updated_at = "1001".into();
+        let mut tool = AiToolCallRecord::new("tool-1", "run_command", 0);
+        tool.status = TOOL_STATUS_COMPLETED.into();
+        tool.exit_status = Some(0);
+        previous.tool_calls.push(tool);
+        (repository, previous)
+    }
+
+    #[test]
+    fn message_injection_commits_a_complete_history_boundary_in_order() {
+        let (repository, previous) = injection_repository("injection-commit");
+        let mut pending = [
+            prepared_injection("insert-one", "session-injection"),
+            prepared_injection("insert-two", "session-injection"),
+        ];
+        let receipt = commit_message_injection(&repository, previous, &mut pending).unwrap();
+        let history = list_chat_messages(&repository, "session-injection").unwrap();
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].status, "complete");
+        assert_eq!(history[0].content, "finished tool output");
+        assert_eq!(history[0].thinking, "reasoning");
+        assert_eq!(history[0].tool_calls[0].exit_status, Some(0));
+        assert_eq!(history[1].id, "insert-one");
+        assert_eq!(history[2].id, "insert-two");
+        assert_eq!(history[3].id, receipt.assistant_message.id);
+        assert_eq!(history[3].status, "streaming");
+        assert_eq!(receipt.queue_ids, ["insert-one", "insert-two"]);
+    }
+
+    #[test]
+    fn message_injection_failure_rolls_back_the_old_reply_and_all_insertions() {
+        let (repository, previous) = injection_repository("injection-rollback");
+        let mut pending = [
+            prepared_injection("duplicate", "session-injection"),
+            prepared_injection("duplicate", "session-injection"),
+        ];
+        assert!(commit_message_injection(&repository, previous, &mut pending).is_err());
+        let history = list_chat_messages(&repository, "session-injection").unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "streaming");
+        assert_eq!(history[0].content, "partial");
+        assert!(history[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn message_injection_preserves_stopped_reply_and_completed_file_changes_after_preemption() {
+        let (repository, mut previous) = injection_repository("injection-preemption");
+        previous.status = "stopped".into();
+        let mut cancelled = AiToolCallRecord::new("tool-2", "run_command", 0);
+        cancelled.status = TOOL_STATUS_CANCELLED.into();
+        previous.tool_calls.push(cancelled);
+        previous.file_changes.push(AiFileChangeSummary {
+            checkpoint_id: "saved-change".into(),
+            message_id: "old-reply".into(),
+            status: "applied".into(),
+            files: Vec::new(),
+            added_lines: 1,
+            removed_lines: 0,
+            remaining_changes: 1,
+        });
+        let mut pending = [prepared_injection("new-task", "session-injection")];
+        let receipt = commit_message_injection(&repository, previous, &mut pending).unwrap();
+        let history = list_chat_messages(&repository, "session-injection").unwrap();
+        assert_eq!(history[0].status, "stopped");
+        assert_eq!(history[0].tool_calls[0].status, TOOL_STATUS_COMPLETED);
+        assert_eq!(history[0].tool_calls[1].status, TOOL_STATUS_CANCELLED);
+        assert_eq!(receipt.previous_message.status, "stopped");
+        assert_eq!(
+            receipt.previous_message.file_changes[0].checkpoint_id,
+            "saved-change"
+        );
+        assert_eq!(history[1].id, "new-task");
+        assert_eq!(history[2].status, "streaming");
+    }
 
     #[test]
     fn legacy_preview_migration_preserves_real_approvals_and_metadata() {

@@ -50,7 +50,6 @@ import {
   aiChatSessionGet,
   aiFileChangesUndo,
   aiChatSessionList,
-  aiChatStreamStart,
   aiChatStreamStop,
   aiChatToolAnswer,
   aiChatToolDecision,
@@ -76,6 +75,9 @@ import { AiModelPicker } from "./AiModelPicker";
 import { AiMessageTimeline } from "./AiMessageTimeline";
 import { AiFileActivitySummary } from "./AiFileActivitySummary";
 import { AiFileChangesSummary } from "./AiFileChangesSummary";
+import { AiQueuedMessages } from "./AiQueuedMessages";
+import type { AiSettings } from "../settings/settingsTypes";
+import { canEditAiQueuedMessage, finishAiMessageQueue, queueAiMessage, sendQueuedAiMessageNow, startAiMessage, stopAiMessage } from "./aiMessageQueue";
 import { applyFileChangeSummaries } from "./aiFileChanges";
 import { getFileActivity, isFileActivity } from "./aiFileActivity";
 import {
@@ -93,6 +95,7 @@ import {
 import { appendThinkingDelta, finishThinkingBlock } from "./aiMessageFlow";
 import type {
   AiChatMessage,
+  AiChatStreamStartRequest,
   AiFileChangeSummary,
   AiChatStreamEvent,
   AiChatSessionSummary,
@@ -117,6 +120,7 @@ export interface AiAssistantPanelProps {
   recentCommands: CommandHistoryEntry[];
   recentTerminalOutput?: string | null;
   sendShortcutBinding?: string | null;
+  runningSendBehavior?: AiSettings["runningSendBehavior"];
   terminalDirectory?: string | null;
   terminalSessionId?: string | null;
   terminalTitle?: string | null;
@@ -203,6 +207,7 @@ export function AiAssistantPanel({
   recentCommands,
   recentTerminalOutput,
   sendShortcutBinding,
+  runningSendBehavior = "queue",
   terminalDirectory,
   terminalSessionId,
   terminalTitle,
@@ -229,6 +234,7 @@ export function AiAssistantPanel({
   );
   const [activeSessionId, setActiveSessionId] = useAiScopeField(scopeKey, "activeSessionId", active);
   const [messages, setMessages] = useAiScopeField(scopeKey, "messages", active);
+  const [queuedMessages, setQueuedMessages] = useAiScopeField(scopeKey, "queuedMessages", active);
   const [contextBlocks, setContextBlocks] = useAiScopeField(scopeKey, "contextBlocks", active);
   const [input, setInput] = useAiScopeField(scopeKey, "input", active);
   const [remoteWorkspacePath, setRemoteWorkspacePath] = useAiScopeField(scopeKey, "remoteWorkspacePath", active);
@@ -418,9 +424,16 @@ export function AiAssistantPanel({
     icon: reasoningLevelIcon(level),
     searchText: level,
   }));
-  const sendDisabled =
-    Boolean(streamState) || loading || imageAttachmentLoading || !selectedProvider ||
-    (input.trim().length === 0 && contextBlocks.length === 0);
+  const hasComposeContent = input.trim().length > 0 || contextBlocks.length > 0;
+  const showStopControl = Boolean(streamState) && !hasComposeContent;
+  const sendDisabled = loading || imageAttachmentLoading || !selectedProvider || !hasComposeContent;
+  const insertComposeImmediately = runningSendBehavior === "immediate" && Boolean(streamState?.request?.agent) && !streamState?.stopRequested;
+  const composeSendLabel = streamState ? insertComposeImmediately ? "立即插入" : "加入队列" : "发送";
+  const composeActionLabel = showStopControl
+    ? streamState?.stopRequested ? "正在停止" : "停止生成"
+    : loading ? "准备中" : streamState
+      ? insertComposeImmediately ? "取消当前执行并立即插入" : "加入队列，本轮结束后发送"
+      : "发送";
   const visibleAuditEvents = auditEvents.filter((entry) => {
     const query = auditQuery.trim().toLocaleLowerCase();
     if (!query) {
@@ -679,11 +692,12 @@ export function AiAssistantPanel({
 
   async function submit(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
+    if (sendDisabled) return;
     await sendMessage(input, contextBlocks);
   }
 
   async function sendMessage(content: string, contexts: AiContextBlock[]) {
-    if (readCurrentStreamState() || loadingRef.current) {
+    if (!active || loadingRef.current) {
       return;
     }
     const normalizedContent = content.trim();
@@ -699,81 +713,45 @@ export function AiAssistantPanel({
       setError("请输入问题或添加附件。");
       return;
     }
-    loadingRef.current = true;
-    setLoading(true);
     setError(null);
     setNotice(null);
-    resetMessageListScrollFollow();
-    try {
-      const terminalOutput = (recentTerminalOutput || "").trim();
-      const response = await aiChatStreamStart({
-        provider_config_id: selectedProvider.id,
-        session_id: activeSessionId,
-        content: normalizedContent,
-        contexts,
-        host_scope: currentHostScope,
-        connection_id: connection?.id ?? null,
-        reasoning_level: selectedReasoningLevel || null,
-        agent: agentModeEnabled
-          ? {
-              connection_id: connection?.id ?? null,
-              workspace_type: connection ? "remote" : "local",
-              workspace_path: connection ? effectiveRemoteWorkspace : terminalDirectory ?? null,
-              local_workspace_path: localWorkspace,
-              mode: effectiveAgentMode,
-              working_directory: connection ? effectiveRemoteWorkspace : terminalDirectory ?? null,
-              terminal_output: terminalOutput ? tailByChars(terminalOutput, agentTerminalOutputLimit) : null,
-              terminal_session_id: terminalSessionId ?? null,
-            }
-          : null,
-        model: selectedModel.trim() || null,
-      });
-      const now = Date.now().toString();
-      setActiveSessionId(response.session_id);
-      setMessages((items) => [
-        ...items,
-        {
-          id: response.user_message_id,
-          session_id: response.session_id,
-          role: "user",
-          content: normalizedContent,
-          thinking: "",
-          contexts,
-          commands: [],
-          tool_calls: [],
-          status: "complete",
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          id: response.assistant_message_id,
-          session_id: response.session_id,
-          role: "assistant",
-          content: "",
-          thinking: "",
-          contexts: [],
-          commands: [],
-          tool_calls: [],
-          status: "streaming",
-          created_at: now,
-          updated_at: now,
-        },
-      ]);
-      const nextStreamState = {
-        assistantMessageId: response.assistant_message_id,
-        sessionId: response.session_id,
-        streamId: response.stream_id,
-      };
-      setCurrentStreamState(nextStreamState);
+    const current = readAiScopeState(scopeKey);
+    const terminalOutput = (recentTerminalOutput || "").trim();
+    const request: AiChatStreamStartRequest = {
+      provider_config_id: selectedProvider.id,
+      session_id: current.activeSessionId,
+      content: normalizedContent,
+      contexts,
+      host_scope: currentHostScope,
+      connection_id: connection?.id ?? null,
+      reasoning_level: selectedReasoningLevel || null,
+      agent: agentModeEnabled
+        ? {
+            connection_id: connection?.id ?? null,
+            workspace_type: connection ? "remote" : "local",
+            workspace_path: connection ? effectiveRemoteWorkspace : terminalDirectory ?? null,
+            local_workspace_path: localWorkspace,
+            mode: effectiveAgentMode,
+            working_directory: connection ? effectiveRemoteWorkspace : terminalDirectory ?? null,
+            terminal_output: terminalOutput ? tailByChars(terminalOutput, agentTerminalOutputLimit) : null,
+            terminal_session_id: terminalSessionId ?? null,
+          }
+        : null,
+      model: selectedModel.trim() || null,
+    };
+    setInput("");
+    setContextBlocks([]);
+    if (current.streamState) {
+      // Follow-up sends retain the running turn's host and model selection.
+      const queueId = queueAiMessage(scopeKey, { ...(current.streamState.request || request), content: normalizedContent, contexts });
+      if (runningSendBehavior === "immediate" && current.streamState.request?.agent && !current.streamState.stopRequested) {
+        await sendQueuedAiMessageNow(scopeKey, queueId, ensureAiScopeStreamListener);
+      }
+    } else {
+      resetMessageListScrollFollow();
       setDecidingToolCallIds([]);
-      setInput("");
-      setContextBlocks([]);
+      await startAiMessage(scopeKey, request, ensureAiScopeStreamListener);
       void reloadSessions();
-    } catch (nextError) {
-      setError(formatAiError(nextError));
-    } finally {
-      loadingRef.current = false;
-      setLoading(false);
     }
   }
 
@@ -852,7 +830,7 @@ export function AiAssistantPanel({
       return;
     }
     try {
-      await aiChatStreamStop(streamState.streamId);
+      await stopAiMessage(scopeKey);
     } catch (nextError) {
       setError(formatAiError(nextError));
     }
@@ -869,6 +847,7 @@ export function AiAssistantPanel({
         setCurrentStreamState(null);
       }
       await aiChatSessionDelete(pendingDeleteSession.id);
+      setQueuedMessages((items) => items.filter((item) => item.sessionId !== pendingDeleteSession.id));
       if (activeSessionId === pendingDeleteSession.id) {
         resetMessageListScrollFollow();
         setActiveSessionId(null);
@@ -897,6 +876,7 @@ export function AiAssistantPanel({
       const cleared = await aiChatSessionClear(activeSessionId);
       resetMessageListScrollFollow();
       setMessages(cleared.messages);
+      setQueuedMessages((items) => items.filter((item) => item.sessionId !== activeSessionId));
       setContextBlocks([]);
       setPendingDangerousCommand(null);
       setClearSessionOpen(false);
@@ -1855,6 +1835,16 @@ export function AiAssistantPanel({
         }}
       />
       <form className="ai-compose" onSubmit={(event) => void submit(event)}>
+        <AiQueuedMessages
+          key={activeSessionId || "new"}
+          items={queuedMessages.filter((item) => item.sessionId === (activeSessionId || ""))}
+          running={Boolean(streamState)}
+          canInsert={!streamState || Boolean(streamState.request?.agent) && !streamState.stopRequested}
+          onSend={(id) => active && sendQueuedAiMessageNow(scopeKey, id, ensureAiScopeStreamListener)}
+          onDelete={(id) => setQueuedMessages((items) => items.filter((item) => item.id !== id || !canEditAiQueuedMessage(item)))}
+          onEdit={(id, content) => setQueuedMessages((items) => items.map((item) => item.id === id && canEditAiQueuedMessage(item)
+            ? { ...item, content, status: "queued", error: undefined } : item))}
+        />
         <div className="ai-compose-box">
           {contextBlocks.length > 0 ? (
             <div className="ai-compose-context-list" aria-label={`已添加 ${contextBlocks.length.toString()} 个上下文片段`}>
@@ -2040,29 +2030,17 @@ export function AiAssistantPanel({
                 />
               </Tooltip>
             ) : null}
-            {streamState ? (
-              <Tooltip label="停止生成">
-                <button
-                  aria-label="停止"
-                  className="ai-stop-button ai-compose-icon-button"
-                  type="button"
-                  onClick={() => void stopStreaming()}
-                >
-                  <Square className="ui-icon" aria-hidden="true" />
-                </button>
-              </Tooltip>
-            ) : (
-              <Tooltip label={loading ? "准备中" : "发送"}>
-                <button
-                  aria-label={loading ? "准备中" : "发送"}
-                  className="ai-compose-send"
-                  type="submit"
-                  disabled={sendDisabled}
-                >
-                  <Send className="ui-icon" aria-hidden="true" />
-                </button>
-              </Tooltip>
-            )}
+            <Tooltip label={composeActionLabel}>
+              <button
+                aria-label={showStopControl ? composeActionLabel : loading ? "准备中" : composeSendLabel}
+                className="ai-compose-send"
+                type={showStopControl ? "button" : "submit"}
+                disabled={showStopControl ? streamState?.stopRequested : sendDisabled}
+                onClick={showStopControl ? () => void stopStreaming() : undefined}
+              >
+                {showStopControl ? <Square className="ui-icon" aria-hidden="true" /> : <Send className="ui-icon" aria-hidden="true" />}
+              </button>
+            </Tooltip>
           </div>
           </footer>
         </div>
@@ -2084,7 +2062,7 @@ export function AiAssistantPanel({
         <div className="ai-context-menu-title">添加上下文</div>
         <button
           className="ai-context-menu-item"
-          disabled={imageAttachmentLoading || Boolean(streamState)}
+          disabled={imageAttachmentLoading}
           role="menuitem"
           type="button"
           onClick={() => {
@@ -3292,7 +3270,10 @@ function handleAiScopeStreamEvent(event: AiChatStreamEvent) {
     }
     return result.state;
   });
-  effects.forEach(([key, effect]) => emitAiScopeEffect(key, effect));
+  effects.forEach(([key, effect]) => {
+    emitAiScopeEffect(key, effect);
+    if (effect.kind === "stream_ended") finishAiMessageQueue(key, effect.status, ensureAiScopeStreamListener);
+  });
 }
 
 function mapMessageById(
@@ -3398,6 +3379,31 @@ function applyAiStreamEventToScope(
   if (!state.streamState || event.stream_id !== state.streamState.streamId) {
     return unchanged;
   }
+  if (event.kind === "message_injected" && event.injection) {
+    const injection = event.injection;
+    // A committed receipt may be replayed after an IPC retry. Do not append
+    // the same boundary again or route the live stream back to an older reply.
+    if (state.messages.some((message) => message.id === injection.assistant_message.id)) {
+      return {
+        state: { ...state, queuedMessages: state.queuedMessages.filter((item) => !injection.queue_ids.includes(item.id)) },
+        effect: null,
+      };
+    }
+    const messages = mapMessageById(state.messages, event.message_id, (message) => ({
+      ...finishThinkingBlock(message),
+      ...injection.previous_message,
+      thinking_blocks: finishThinkingBlock(message).thinking_blocks,
+    }));
+    return {
+      state: {
+        ...state,
+        messages: [...messages, ...injection.user_messages, injection.assistant_message],
+        streamState: { ...state.streamState, assistantMessageId: injection.assistant_message.id },
+        queuedMessages: state.queuedMessages.filter((item) => !injection.queue_ids.includes(item.id)),
+      },
+      effect: null,
+    };
+  }
   if (event.kind === "chunk") {
     const delta = event.delta || "";
     return withMessages(
@@ -3427,7 +3433,7 @@ function applyAiStreamEventToScope(
     }));
     return {
       state: { ...state, messages, streamState: null },
-      effect: { kind: "stream_ended", status: event.kind, error: event.error ?? null },
+      effect: { kind: "stream_ended", status: state.streamState.stopRequested && event.kind === "finished" ? "stopped" : event.kind, error: event.error ?? null },
     };
   }
   return unchanged;

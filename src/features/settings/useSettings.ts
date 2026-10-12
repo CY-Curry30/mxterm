@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   defaultSettings,
   normalizeSettings,
+  type AiSettings,
   type AppearanceSettings,
   type BasicSettings,
   type CommandSettings,
@@ -21,6 +22,12 @@ export function useSettings() {
   useEffect(() => {
     writeStoredSettings(settings);
   }, [settings]);
+
+  const updateAi = useCallback((update: Partial<AiSettings>) => {
+    setSettings((current) =>
+      normalizeSettings({ ...current, ai: { ...current.ai, ...update } }),
+    );
+  }, []);
 
   const updateBasic = useCallback((update: Partial<BasicSettings>) => {
     setSettings((current) =>
@@ -122,6 +129,7 @@ export function useSettings() {
 
   return {
     settings,
+    updateAi,
     updateAppearance,
     updateBasic,
     updateCommand,
