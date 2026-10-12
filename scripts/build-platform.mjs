@@ -92,8 +92,15 @@ export function resolveSpawnInvocation(command, args, runtime = process) {
     };
   }
 
+  if (runtime.platform === "win32" && command === "pnpm") {
+    return {
+      command: runtime.env?.ComSpec ?? runtime.env?.COMSPEC ?? "cmd.exe",
+      args: ["/d", "/s", "/c", command, ...args],
+    };
+  }
+
   return {
-    command: runtime.platform === "win32" && command === "pnpm" ? "pnpm.cmd" : command,
+    command,
     args,
   };
 }

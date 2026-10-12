@@ -57,3 +57,17 @@ test("Windows pnpm invocation uses the package manager entry point when availabl
     },
   );
 });
+
+test("Windows pnpm invocation falls back to cmd.exe when npm_execpath is unavailable", () => {
+  assert.deepEqual(
+    resolveSpawnInvocation("pnpm", ["tauri", "build"], {
+      execPath: "C:\\Program Files\\nodejs\\node.exe",
+      platform: "win32",
+      env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    }),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", "pnpm", "tauri", "build"],
+    },
+  );
+});
