@@ -10756,17 +10756,6 @@ function RdpSessionStatusPanel({
           <pre className="rdp-session-error" role="alert">{session.error}</pre>
         ) : null}
 
-        {connection ? (
-          <dl className="rdp-session-facts" aria-label="RDP 连接参数">
-            {rdpConnectionFacts(connection).map((fact) => (
-              <div key={fact.label}>
-                <dt>{fact.label}</dt>
-                <dd title={fact.value}>{fact.value}</dd>
-              </div>
-            ))}
-          </dl>
-        ) : null}
-
         {showEmbeddedViewport ? (
           <div className="rdp-embedded-placeholder" ref={setEmbeddedViewport}>
             <MonitorPlay className="ui-icon" aria-hidden="true" />
@@ -13144,45 +13133,6 @@ function rdpAudioLabel(mode: string) {
     return "关闭";
   }
   return "本机";
-}
-
-function rdpConnectionFacts(connection: ConnectionProfile) {
-  const rdp = connection.rdp;
-  return [
-    { label: "地址", value: formatConnectionAddress(connection) },
-    { label: "域名", value: rdp?.domain?.trim() || "未指定" },
-    { label: "显示", value: rdpDisplaySummary(rdp?.display) },
-    { label: "资源", value: rdpResourceSummary(rdp?.resources) },
-    { label: "网关", value: rdpGatewaySummary(rdp?.gateway) },
-    {
-      label: "证书",
-      value: rdpCertificatePolicyLabel(rdp?.security.certificate_policy),
-    },
-  ];
-}
-
-function rdpGatewaySummary(
-  gateway?: NonNullable<ConnectionProfile["rdp"]>["gateway"] | null,
-) {
-  if (!gateway || gateway.mode === "disabled") {
-    return "直连";
-  }
-  const mode = gateway.mode === "auto" ? "自动检测" : "显式网关";
-  const host = gateway.host?.trim();
-  return host ? `${mode} · ${host}` : mode;
-}
-
-function rdpCertificatePolicyLabel(policy?: string | null) {
-  switch (policy) {
-    case "strict":
-      return "严格校验";
-    case "prompt":
-      return "提示确认";
-    case "trust":
-      return "信任服务器证书";
-    default:
-      return "默认策略";
-  }
 }
 
 function previewRdpLaunchForBrowser(
