@@ -781,10 +781,10 @@ pub fn capture_session_screenshot(
 
     #[cfg(windows)]
     {
-        let Some(hwnd) = session.session_hwnd else {
+        let Some(control_hwnd) = session.session_hwnd else {
             return RdpScreenshotResult::failed("该会话没有可截图的画面窗口。");
         };
-        match capture_hwnd_png(hwnd) {
+        match capture_hwnd_png(session.hwnd, control_hwnd) {
             Ok((data_url, width, height)) => RdpScreenshotResult {
                 ok: true,
                 message: format!("已截取 {width}×{height} 画面。"),
@@ -1969,8 +1969,47 @@ fn resize_hosted_window(
 
 /// 截取窗口客户区并编码为 PNG data URL。
 /// 优先 `PrintWindow`（可捕获被遮挡或处于后台的窗口），失败时回退到 `BitBlt`。
+///
+/// 最小化的窗口没有渲染表面，直接截会得到全黑图；这里临时恢复宿主窗口、
+/// 等一帧让 RDP 控件重新绘制，截完再还原最小化状态。
 #[cfg(windows)]
-fn capture_hwnd_png(hwnd: isize) -> Result<(String, u32, u32), AppError> {
+fn capture_hwnd_png(host_hwnd: isize, control_hwnd: isize) -> Result<(String, u32, u32), AppError> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::UpdateWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsIconic, ShowWindow, SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE,
+    };
+
+    let host = HWND(host_hwnd as *mut std::ffi::c_void);
+    let was_minimized = unsafe { IsIconic(host).as_bool() };
+    if was_minimized {
+        // SW_SHOWNOACTIVATE 恢复窗口但不抢焦点，避免打断用户在主窗口的操作；
+        // 个别情况下它不解除最小化，再退回 SW_RESTORE。
+        unsafe {
+            let _ = ShowWindow(host, SW_SHOWNOACTIVATE);
+            if IsIconic(host).as_bool() {
+                let _ = ShowWindow(host, SW_RESTORE);
+            }
+            let _ = UpdateWindow(host);
+        }
+        // 等一帧让 RDP 控件重新绘制；若此前已降级到待命尺寸，还要等显示重新协商。
+        std::thread::sleep(std::time::Duration::from_millis(350));
+    }
+
+    let captured = capture_client_area_png(control_hwnd);
+
+    if was_minimized {
+        unsafe {
+            let _ = ShowWindow(host, SW_MINIMIZE);
+        }
+    }
+
+    captured
+}
+
+/// 从指定窗口的客户区抓取像素并编码为 PNG。
+#[cfg(windows)]
+fn capture_client_area_png(control_hwnd: isize) -> Result<(String, u32, u32), AppError> {
     use base64::Engine;
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::Graphics::Gdi::{
@@ -1981,7 +2020,7 @@ fn capture_hwnd_png(hwnd: isize) -> Result<(String, u32, u32), AppError> {
     use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
     use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, PW_RENDERFULLCONTENT};
 
-    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    let hwnd = HWND(control_hwnd as *mut std::ffi::c_void);
     let mut rect = RECT::default();
     unsafe { GetClientRect(hwnd, &mut rect) }.map_err(|error| {
         AppError::new(
@@ -2069,6 +2108,20 @@ fn capture_hwnd_png(hwnd: isize) -> Result<(String, u32, u32), AppError> {
     for pixel in rgba.chunks_exact_mut(4) {
         pixel.swap(0, 2);
         pixel[3] = 255;
+    }
+
+    // 全黑通常意味着窗口没有渲染表面（最小化、被 DWM 挂起或尚未绘制）。
+    // 返回黑图会让用户以为截图成功，这里直接报错更诚实。
+    let has_content = rgba
+        .chunks_exact(4)
+        .any(|pixel| pixel[0] > 8 || pixel[1] > 8 || pixel[2] > 8);
+    if !has_content {
+        return Err(AppError::new(
+            "rdp_screenshot_blank",
+            "截图内容为空，RDP 画面可能尚未渲染完成，请等画面可见后重试。",
+            "all pixels are black",
+            true,
+        ));
     }
 
     let mut encoded = Vec::new();
@@ -4289,6 +4342,22 @@ fn configure_classic_activex_client(
         configure_classic_activex_password_prompting_interfaces(dispatch, config);
     }
 
+    // Win 键和系统组合键能否发往远程由 SecuredSettings 决定：
+    // AdvancedSettings 上的同名属性只是镜像，部分 mstscax 版本不生效。
+    // EnableWindowsKey 允许 Win 键进入远程会话；KeyboardHookMode=2 表示始终使用远程键盘钩子
+    // （默认 1 只在全屏时生效，窗口模式下 Win+E / Win+R 会被本地系统消费）。
+    let secured = get_activex_dispatch_by_name(dispatch, "SecuredSettings")
+        .or_else(|| get_activex_dispatch_id(dispatch, &[("SecuredSettings", 235)]));
+    match secured {
+        Some(secured) => {
+            put_activex_property_by_name_optional(&secured, "EnableWindowsKey", true.into());
+            put_activex_property_by_name_optional(&secured, "KeyboardHookMode", 2i32.into());
+        }
+        None => eprintln!(
+            "[rdp] SecuredSettings unavailable; Windows key forwarding may stay local"
+        ),
+    }
+
     Ok(())
 }
 
@@ -6114,6 +6183,34 @@ fn put_activex_property_id_optional(
     value: windows::Win32::System::Variant::VARIANT,
 ) {
     let _ = put_activex_property_id(dispatch, name, dispid, value);
+}
+
+/// 按属性名获取子 IDispatch。比按 DISPID 猜测更稳，
+/// 不同版本的 mstscax 类型库对同名属性的编号可能不同。
+#[cfg(windows)]
+fn get_activex_dispatch_by_name(
+    dispatch: &windows::Win32::System::Com::IDispatch,
+    name: &str,
+) -> Option<windows::Win32::System::Com::IDispatch> {
+    use windows::core::PCWSTR;
+
+    let wide = to_wide_null(name);
+    let name_ptr = PCWSTR(wide.as_ptr());
+    let mut dispid = 0i32;
+    unsafe {
+        dispatch
+            .GetIDsOfNames(
+                &windows::core::GUID::zeroed(),
+                &name_ptr,
+                1,
+                0x0409,
+                &mut dispid,
+            )
+            .ok()?;
+    }
+    get_activex_property_id(dispatch, name, dispid)
+        .ok()
+        .and_then(|variant| windows::Win32::System::Com::IDispatch::try_from(&variant).ok())
 }
 
 #[cfg(windows)]
