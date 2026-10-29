@@ -7024,7 +7024,11 @@ export function WorkspaceShell() {
     }
 
     try {
-      const result = await rdpLaunchConnection(connection.id);
+      const result = await rdpLaunchConnection(
+        connection.id,
+        null,
+        settings.basic.forwardWindowsKeysToRemote,
+      );
       if (!rdpSessionExists(sessionId)) {
         if (result.session_id) {
           await rdpCloseSession(result.session_id).catch(() => undefined);

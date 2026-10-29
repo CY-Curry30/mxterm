@@ -43,6 +43,9 @@ pub struct RdpConnectionRequest {
     pub bounds: Option<RdpEmbeddedBounds>,
     #[serde(default)]
     pub appearance: Option<NativeRdpAppearance>,
+    /// 是否将 Win 键与系统组合键转发到远程 RDP 会话；缺省时视为开启。
+    #[serde(default)]
+    pub forward_windows_keys: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -554,6 +557,7 @@ pub async fn launch_connection(
             &resolved,
             requested_bounds.as_ref(),
             request.appearance,
+            request.forward_windows_keys.unwrap_or(true),
         )
         .await
         {
@@ -1030,7 +1034,7 @@ fn build_mstsc_plan(
     resolved: &ResolvedRdpConnection,
     preview: bool,
 ) -> Result<LaunchPlan, AppError> {
-    let content = serialize_rdp_file(&resolved.profile, &resolved.rdp)?;
+    let content = serialize_rdp_file(&resolved.profile, &resolved.rdp, true)?;
     if preview {
         return Ok(LaunchPlan {
             args: vec!["<temp.rdp>".to_string()],
@@ -1116,7 +1120,7 @@ fn build_custom_plan(
     resolved: &ResolvedRdpConnection,
     preview: bool,
 ) -> Result<LaunchPlan, AppError> {
-    let content = serialize_rdp_file(&resolved.profile, &resolved.rdp)?;
+    let content = serialize_rdp_file(&resolved.profile, &resolved.rdp, true)?;
     let template = resolved
         .rdp
         .runner
@@ -1150,6 +1154,7 @@ fn build_custom_plan(
 fn serialize_rdp_file(
     profile: &ConnectionProfile,
     rdp: &RdpConnectionConfig,
+    forward_windows_keys: bool,
 ) -> Result<String, AppError> {
     let mut lines = Vec::new();
     let experience = rdp_experience_settings(&rdp.performance);
@@ -1185,8 +1190,11 @@ fn serialize_rdp_file(
         if rdp.display.use_multimon { 1 } else { 0 }
     ));
     // 2 = 始终使用远程键盘钩子。默认值 1 只在全屏时转发 Win 键，
-    // 窗口模式下 Win+E 等组合键会被本地系统消费。
-    lines.push("keyboardhook:i:2".to_string());
+    // 窗口模式下 Win+E 等组合键会被本地系统消费。关闭转发时写回 1。
+    lines.push(format!(
+        "keyboardhook:i:{}",
+        if forward_windows_keys { 2 } else { 1 }
+    ));
     lines.push(format!("session bpp:i:{}", experience.session_bpp));
     lines.push(format!("connection type:i:{}", experience.connection_type));
     lines.push("networkautodetect:i:0".to_string());
@@ -1671,6 +1679,7 @@ struct ActiveXRdpConfig {
     gateway_host: Option<String>,
     password: Option<String>,
     rdp_file_content: String,
+    forward_windows_keys: bool,
 }
 
 #[cfg(windows)]
@@ -1678,6 +1687,7 @@ impl ActiveXRdpConfig {
     fn from_resolved(
         resolved: &ResolvedRdpConnection,
         bounds: Option<&RdpEmbeddedBounds>,
+        forward_windows_keys: bool,
     ) -> Result<Self, AppError> {
         let fallback_width = bounds.map(|item| item.width).unwrap_or(1440);
         let fallback_height = bounds.map(|item| item.height).unwrap_or(900);
@@ -1696,7 +1706,7 @@ impl ActiveXRdpConfig {
         let mut rdp_for_host = resolved.rdp.clone();
         rdp_for_host.display.width = Some(width.min(u16::MAX as u32) as u16);
         rdp_for_host.display.height = Some(height.min(u16::MAX as u32) as u16);
-        let rdp_file_content = serialize_rdp_file(&resolved.profile, &rdp_for_host)?;
+        let rdp_file_content = serialize_rdp_file(&resolved.profile, &rdp_for_host, forward_windows_keys)?;
 
         Ok(Self {
             appearance: None,
@@ -1738,6 +1748,7 @@ impl ActiveXRdpConfig {
                 .and_then(|gateway| gateway.host.clone()),
             password: resolved.password.clone(),
             rdp_file_content,
+            forward_windows_keys,
         })
     }
 }
@@ -1778,9 +1789,10 @@ async fn host_activex_session(
     resolved: &ResolvedRdpConnection,
     bounds: Option<&RdpEmbeddedBounds>,
     appearance: Option<NativeRdpAppearance>,
+    forward_windows_keys: bool,
 ) -> Result<HostedRdpSession, AppError> {
     let owner = main_window_hwnd(app)?;
-    let mut config = ActiveXRdpConfig::from_resolved(resolved, bounds)?;
+    let mut config = ActiveXRdpConfig::from_resolved(resolved, bounds, forward_windows_keys)?;
     config.appearance = appearance;
     let bounds = native_session_window_bounds(owner, &config, bounds);
     let owner_hwnd = owner.0 as isize;
@@ -4346,16 +4358,18 @@ fn configure_classic_activex_client(
     // AdvancedSettings 上的同名属性只是镜像，部分 mstscax 版本不生效。
     // EnableWindowsKey 允许 Win 键进入远程会话；KeyboardHookMode=2 表示始终使用远程键盘钩子
     // （默认 1 只在全屏时生效，窗口模式下 Win+E / Win+R 会被本地系统消费）。
-    let secured = get_activex_dispatch_by_name(dispatch, "SecuredSettings")
-        .or_else(|| get_activex_dispatch_id(dispatch, &[("SecuredSettings", 235)]));
-    match secured {
-        Some(secured) => {
-            put_activex_property_by_name_optional(&secured, "EnableWindowsKey", true.into());
-            put_activex_property_by_name_optional(&secured, "KeyboardHookMode", 2i32.into());
+    if config.forward_windows_keys {
+        let secured = get_activex_dispatch_by_name(dispatch, "SecuredSettings")
+            .or_else(|| get_activex_dispatch_id(dispatch, &[("SecuredSettings", 235)]));
+        match secured {
+            Some(secured) => {
+                put_activex_property_by_name_optional(&secured, "EnableWindowsKey", true.into());
+                put_activex_property_by_name_optional(&secured, "KeyboardHookMode", 2i32.into());
+            }
+            None => eprintln!(
+                "[rdp] SecuredSettings unavailable; Windows key forwarding may stay local"
+            ),
         }
-        None => eprintln!(
-            "[rdp] SecuredSettings unavailable; Windows key forwarding may stay local"
-        ),
     }
 
     Ok(())
@@ -6511,6 +6525,7 @@ mod tests {
         let content = serialize_rdp_file(
             &rdp_profile(),
             &config_with_certificate_policy(RdpCertificatePolicy::Prompt),
+            true,
         )
         .unwrap();
 
@@ -6522,11 +6537,13 @@ mod tests {
         let trust = serialize_rdp_file(
             &rdp_profile(),
             &config_with_certificate_policy(RdpCertificatePolicy::Trust),
+            true,
         )
         .unwrap();
         let strict = serialize_rdp_file(
             &rdp_profile(),
             &config_with_certificate_policy(RdpCertificatePolicy::Strict),
+            true,
         )
         .unwrap();
 
@@ -6536,7 +6553,7 @@ mod tests {
 
     #[test]
     fn rdp_default_experience_enables_desktop_composition() {
-        let content = serialize_rdp_file(&rdp_profile(), &RdpConnectionConfig::default()).unwrap();
+        let content = serialize_rdp_file(&rdp_profile(), &RdpConnectionConfig::default(), true).unwrap();
 
         assert!(content.contains("smart sizing:i:1\r\n"));
         assert!(content.contains("session bpp:i:32\r\n"));
@@ -6559,6 +6576,7 @@ mod tests {
                 },
                 ..RdpConnectionConfig::default()
             },
+            true,
         )
         .unwrap();
 
@@ -6579,6 +6597,7 @@ mod tests {
                 },
                 ..RdpConnectionConfig::default()
             },
+            true,
         )
         .unwrap();
 
