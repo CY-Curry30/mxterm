@@ -233,6 +233,24 @@ const MX_RDP_LOGIN_RESIZE_INTERVAL_MS: u32 = 300;
 #[cfg(windows)]
 const MX_RDP_CONTROL_RESIZE_SUBCLASS_ID: usize = 0x4d58_5244_5052_535a;
 
+/// 隐藏会话进入待命尺寸前的等待时间。短暂切换标签页不触发远端桌面重排。
+#[cfg(windows)]
+const MX_RDP_PARK_DELAY_MS: u64 = 30_000;
+
+/// 检查隐藏会话是否已可以进入待命的轮询间隔。
+#[cfg(windows)]
+const MX_RDP_PARK_CHECK_INTERVAL_MS: u32 = 10_000;
+
+#[cfg(windows)]
+const MX_RDP_PARK_TIMER_ID: usize = 0x4d58_5041;
+
+/// 待命会话保持的远端桌面尺寸。RDP 不接受 0 尺寸，这里取协议下限附近的安全值。
+#[cfg(windows)]
+const MX_RDP_PARKED_WIDTH: u32 = 640;
+
+#[cfg(windows)]
+const MX_RDP_PARKED_HEIGHT: u32 = 480;
+
 impl RdpSessionManager {
     #[cfg(windows)]
     fn native_host(&self) -> Result<Option<NativeRdpHostHandle>, AppError> {
@@ -2060,6 +2078,9 @@ struct ActiveXHostWindowState {
     chrome_pressed_button: Option<RdpHostChromeButton>,
     chrome_hot_tab_close: Option<usize>,
     chrome_pressed_tab_close: Option<usize>,
+    park_timer_running: bool,
+    /// 整个 host 窗口处于最小化状态。此时当前标签页同样不可见，也要参与待命降级。
+    window_minimized: bool,
 }
 
 #[cfg(windows)]
@@ -2091,6 +2112,10 @@ struct ActiveXHostSession {
     last_width: u32,
     last_height: u32,
     last_scale_factor: u32,
+    /// 隐藏超过阈值后是否已把远端桌面降到待命尺寸。
+    parked: bool,
+    /// 该会话从何时开始不可见；可见时为 None。
+    hidden_since: Option<std::time::Instant>,
 }
 
 #[cfg(windows)]
@@ -2256,6 +2281,8 @@ fn add_activex_host_session(
         last_width: 0,
         last_height: 0,
         last_scale_factor: 0,
+        parked: false,
+        hidden_since: None,
     };
     if let Err(error) = connect_activex_client(&session.client) {
         session.subscription.take();
@@ -2332,6 +2359,7 @@ fn close_activex_host_session(
             }
         }
     }
+    schedule_activex_park_timer(hwnd, state);
 }
 
 #[cfg(windows)]
@@ -2357,6 +2385,13 @@ fn activate_activex_tab(
 }
 
 #[cfg(windows)]
+fn window_is_minimized(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+
+    unsafe { IsIconic(hwnd).as_bool() }
+}
+
+#[cfg(windows)]
 fn layout_activex_host_sessions(
     hwnd: windows::Win32::Foundation::HWND,
     state: &mut ActiveXHostWindowState,
@@ -2367,6 +2402,11 @@ fn layout_activex_host_sessions(
         SW_HIDE, SW_SHOW,
     };
 
+    // 最小化时客户区为 0×0，布局和显示协商都没有意义；此时由降级流程接管。
+    if window_is_minimized(hwnd) {
+        return;
+    }
+    state.window_minimized = false;
     let Some((client_x, content_y, content_width, content_height)) =
         rdp_content_rect_for_window(hwnd)
     else {
@@ -2391,13 +2431,143 @@ fn layout_activex_host_sessions(
             );
         }
         if visible {
+            session.hidden_since = None;
             install_activex_resize_subclasses(session.control_hwnd, hwnd);
+            restore_activex_session_display(hwnd, session);
             sync_activex_session_display(hwnd, session, force_display_sync);
+        } else if session.hidden_since.is_none() {
+            session.hidden_since = Some(std::time::Instant::now());
         }
     }
     layout_native_host_resize_grips(hwnd, &state.resize_grips);
     update_native_host_title(hwnd, state);
     refresh_activex_connection_feedback(hwnd, state);
+    schedule_activex_park_timer(hwnd, state);
+}
+
+/// 隐藏会话在超过等待阈值后把远端桌面降到待命尺寸，释放帧缓冲和位图缓存。
+/// 只有登录完成后的会话才降级：登录期的显示协商必须保持原样。
+#[cfg(windows)]
+fn park_activex_session_display(session: &mut ActiveXHostSession) {
+    if session.parked || !session.dynamic_resize || !session.connection.display_ready() {
+        return;
+    }
+    match apply_activex_display_settings(session, MX_RDP_PARKED_WIDTH, MX_RDP_PARKED_HEIGHT, 100) {
+        Ok(true) => {
+            session.parked = true;
+            // 清空缓存，恢复时按窗口尺寸强制重新协商。
+            session.last_width = 0;
+            session.last_height = 0;
+            session.last_scale_factor = 0;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!(
+                "[rdp] park display {}: {}",
+                session.session_id, error.raw_message
+            );
+        }
+    }
+}
+
+/// 会话重新可见时立即回到窗口实际尺寸。
+#[cfg(windows)]
+fn restore_activex_session_display(
+    hwnd: windows::Win32::Foundation::HWND,
+    session: &mut ActiveXHostSession,
+) {
+    if !session.parked {
+        return;
+    }
+    session.parked = false;
+    session.last_width = 0;
+    session.last_height = 0;
+    session.last_scale_factor = 0;
+    sync_activex_session_display(hwnd, session, true);
+}
+
+/// 把全部会话标记为不可见。窗口最小化时当前标签页同样不可见。
+/// 已隐藏的会话保留原起点，避免最小化把它们的降级时间往后推。
+#[cfg(windows)]
+fn mark_activex_sessions_hidden_for_minimize(
+    hwnd: windows::Win32::Foundation::HWND,
+    state: &mut ActiveXHostWindowState,
+) {
+    state.window_minimized = true;
+    let now = std::time::Instant::now();
+    for session in state.sessions.iter_mut() {
+        if session.hidden_since.is_none() {
+            session.hidden_since = Some(now);
+        }
+    }
+    schedule_activex_park_timer(hwnd, state);
+}
+
+#[cfg(windows)]
+fn park_hidden_activex_sessions(state: &mut ActiveXHostWindowState) {
+    let active_index = state.active_index;
+    let minimized = state.window_minimized;
+    let now = std::time::Instant::now();
+    let delay = std::time::Duration::from_millis(MX_RDP_PARK_DELAY_MS);
+    for (index, session) in state.sessions.iter_mut().enumerate() {
+        let is_visible = index == active_index && !minimized;
+        if !should_park_now(now, session.hidden_since, session.parked, delay, is_visible) {
+            continue;
+        }
+        park_activex_session_display(session);
+    }
+}
+
+/// 判断一个会话本轮是否需要降级：只有不可见且已过等待阈值、尚未降级的会话才处理。
+/// 抽成纯函数，便于在不创建窗口的情况下验证时序和最小化语义。
+#[cfg(any(windows, test))]
+fn should_park_now(
+    now: std::time::Instant,
+    hidden_since: Option<std::time::Instant>,
+    parked: bool,
+    delay: std::time::Duration,
+    is_visible: bool,
+) -> bool {
+    if is_visible {
+        return false;
+    }
+    if parked {
+        return false;
+    }
+    hidden_since.is_some_and(|since| now.saturating_duration_since(since) >= delay)
+}
+
+#[cfg(windows)]
+fn schedule_activex_park_timer(
+    hwnd: windows::Win32::Foundation::HWND,
+    state: &mut ActiveXHostWindowState,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+
+    let active_index = state.active_index;
+    let minimized = state.window_minimized;
+    let pending = state.sessions.iter().enumerate().any(|(index, session)| {
+        let is_visible = index == active_index && !minimized;
+        !is_visible && session.hidden_since.is_some() && !session.parked
+    });
+    if pending {
+        if !state.park_timer_running {
+            unsafe {
+                let _ = SetTimer(
+                    Some(hwnd),
+                    MX_RDP_PARK_TIMER_ID,
+                    MX_RDP_PARK_CHECK_INTERVAL_MS,
+                    None,
+                );
+            }
+            state.park_timer_running = true;
+        }
+    } else if state.park_timer_running {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), MX_RDP_PARK_TIMER_ID);
+        }
+        state.park_timer_running = false;
+    }
 }
 
 #[cfg(windows)]
@@ -2489,6 +2659,8 @@ fn retry_activex_connection(
         session.connection = connection_state::ConnectionState::new();
         session.last_width = 0;
         session.last_height = 0;
+        session.last_scale_factor = 0;
+        session.parked = false;
         connect_activex_client(&session.client)
     })();
     if let Err(error) = result {
@@ -2663,6 +2835,8 @@ fn run_activex_host(
             chrome_pressed_button: None,
             chrome_hot_tab_close: None,
             chrome_pressed_tab_close: None,
+            park_timer_running: false,
+            window_minimized: false,
         });
         unsafe {
             SetWindowLongPtrW(
@@ -2826,6 +3000,9 @@ unsafe extern "system" fn rdp_activex_host_wndproc(
                     &mut *state,
                     message == WM_DPICHANGED,
                 );
+            } else {
+                // 最小化后窗口整体不可见，当前标签页也要按同一阈值降级。
+                mark_activex_sessions_hidden_for_minimize(hwnd, &mut *state);
             }
         }
     } else if message == WM_SHOWWINDOW && wparam.0 != 0 {
@@ -2920,6 +3097,13 @@ unsafe extern "system" fn rdp_activex_host_wndproc(
             if (*state).login_resize_ticks_remaining == 0 {
                 let _ = KillTimer(Some(hwnd), MX_RDP_LOGIN_RESIZE_TIMER_ID);
             }
+        }
+        return windows::Win32::Foundation::LRESULT(0);
+    } else if message == WM_TIMER && wparam.0 == MX_RDP_PARK_TIMER_ID {
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ActiveXHostWindowState;
+        if !state.is_null() {
+            park_hidden_activex_sessions(&mut *state);
+            schedule_activex_park_timer(hwnd, &mut *state);
         }
         return windows::Win32::Foundation::LRESULT(0);
     } else if message == WM_ERASEBKGND {
@@ -3987,7 +4171,34 @@ fn sync_activex_session_display(
         return;
     }
 
-    let result = match &session.client {
+    let result = apply_activex_display_settings(session, width, height, scale_factor);
+
+    match result {
+        Ok(true) => {
+            session.last_width = width;
+            session.last_height = height;
+            session.last_scale_factor = scale_factor;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!(
+                "[rdp] display sync {width}x{height} @{scale_factor}%: {}",
+                error.raw_message
+            );
+        }
+    }
+}
+
+/// 向控件下发显示设置。返回 `Ok(false)` 表示会话尚未连接、本次请求被跳过，
+/// 调用方不应把该尺寸记为已生效。
+#[cfg(windows)]
+fn apply_activex_display_settings(
+    session: &ActiveXHostSession,
+    width: u32,
+    height: u32,
+    scale_factor: u32,
+) -> Result<bool, AppError> {
+    match &session.client {
         HostedActiveXClient::Modern(client) => {
             unsafe { client.UpdateSessionDisplaySettings(width, height) }.map_err(|error| {
                 AppError::new(
@@ -3996,7 +4207,8 @@ fn sync_activex_session_display(
                     error.to_string(),
                     true,
                 )
-            })
+            })?;
+            Ok(true)
         }
         HostedActiveXClient::Classic(dispatch) => {
             // Connect() is asynchronous. Do not cache an update made before
@@ -4012,10 +4224,10 @@ fn sync_activex_session_display(
                 })
             }) {
                 Ok(value) if value != 0 => {}
-                Ok(_) => return,
+                Ok(_) => return Ok(false),
                 Err(error) => {
                     eprintln!("[rdp] display sync state: {}", error.raw_message);
-                    return;
+                    return Ok(false);
                 }
             }
             // Stable DISPID from IMsRdpClient9 in the MSTSC type library.
@@ -4035,21 +4247,8 @@ fn sync_activex_session_display(
                     height.into(),
                     width.into(),
                 ],
-            )
-        }
-    };
-
-    match result {
-        Ok(()) => {
-            session.last_width = width;
-            session.last_height = height;
-            session.last_scale_factor = scale_factor;
-        }
-        Err(error) => {
-            eprintln!(
-                "[rdp] display sync {width}x{height} @{scale_factor}%: {}",
-                error.raw_message
-            );
+            )?;
+            Ok(true)
         }
     }
 }
@@ -4171,9 +4370,8 @@ fn refresh_activex_host_window_after_restore(
     use windows::Win32::Graphics::Gdi::{
         RedrawWindow, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
     };
-    use windows::Win32::UI::WindowsAndMessaging::IsIconic;
 
-    if unsafe { IsIconic(hwnd).as_bool() } {
+    if window_is_minimized(hwnd) {
         return;
     }
 
@@ -5959,7 +6157,7 @@ fn with_activex_control_context(control_name: &str, stage: &str, error: AppError
 
 #[cfg(test)]
 mod tests {
-    use super::{macos_rdp_open_args_with_app, serialize_rdp_file};
+    use super::{macos_rdp_open_args_with_app, serialize_rdp_file, should_park_now};
     use crate::connections::{
         ConnectionAdvancedConfig, ConnectionCredentialMode, ConnectionJumpConfig,
         ConnectionProfile, ConnectionProtocol, ConnectionProxyConfig, RdpCertificatePolicy,
@@ -6163,5 +6361,46 @@ mod tests {
         let args = macos_rdp_open_args_with_app("/tmp/example.rdp".to_string(), None);
 
         assert_eq!(args, vec!["/tmp/example.rdp"]);
+    }
+
+    #[test]
+    fn park_delay_waits_for_threshold_and_skips_parked_sessions() {
+        let start = std::time::Instant::now();
+        let delay = std::time::Duration::from_secs(30);
+
+        // 可见会话不降级。
+        assert!(!should_park_now(start, None, false, delay, true));
+        // 刚切走，未到阈值。
+        assert!(!should_park_now(start, Some(start), false, delay, false));
+        assert!(!should_park_now(
+            start + delay - std::time::Duration::from_millis(1),
+            Some(start),
+            false,
+            delay,
+            false
+        ));
+        // 到达阈值后降级。
+        assert!(should_park_now(start + delay, Some(start), false, delay, false));
+        // 已经降级的会话不重复下发。
+        assert!(!should_park_now(start + delay, Some(start), true, delay, false));
+    }
+
+    #[test]
+    fn minimized_window_parks_the_active_session() {
+        let start = std::time::Instant::now();
+        let delay = std::time::Duration::from_secs(30);
+        let later = start + delay;
+
+        // 当前标签页：窗口未最小化时不降级，最小化后与隐藏标签页同样处理。
+        assert!(!should_park_now(later, Some(start), false, delay, true));
+        assert!(should_park_now(later, Some(start), false, delay, false));
+        // 最小化未满阈值时仍保持原尺寸。
+        assert!(!should_park_now(
+            start + std::time::Duration::from_secs(29),
+            Some(start),
+            false,
+            delay,
+            false
+        ));
     }
 }
