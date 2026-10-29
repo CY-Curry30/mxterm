@@ -97,6 +97,17 @@ pub fn run() {
             {
                 let app_handle = app.handle().clone();
                 let _ = commands::set_window_material(app_handle, 2);
+                // WebView2 默认右键菜单里的「重新加载」会重载前端并清空全部内存会话状态，
+                // 刷新后主窗口回到首页、后端 RDP/VNC 窗口变成孤儿，因此整体关闭默认菜单。
+                if let Some(main_window) = app.get_webview_window("main") {
+                    let _ = main_window.with_webview(|webview| unsafe {
+                        if let Ok(core) = webview.controller().CoreWebView2() {
+                            if let Ok(settings) = core.Settings() {
+                                let _ = settings.SetAreDefaultContextMenusEnabled(false);
+                            }
+                        }
+                    });
+                }
             }
             {
                 let app_handle = app.handle().clone();
