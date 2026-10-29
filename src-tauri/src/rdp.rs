@@ -138,6 +138,28 @@ pub struct RdpSessionRevealResult {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct RdpScreenshotResult {
+    pub ok: bool,
+    pub message: String,
+    /// `data:image/png;base64,...`，失败时为 None。
+    pub data_url: Option<String>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl RdpScreenshotResult {
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: message.into(),
+            data_url: None,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedRdpHostWindowState {
     x: i32,
@@ -707,6 +729,10 @@ pub fn reveal_session(
                         session_id: request.session_id.clone(),
                     });
                     post_native_host_command_message(host.hwnd, host.command_rx_ptr, host.atl_ptr);
+                    // 激活标签页只切换内部会话，窗口本身仍可能在后台或被最小化。
+                    reveal_native_host_window(windows::Win32::Foundation::HWND(
+                        session.hwnd as *mut std::ffi::c_void,
+                    ));
                     return RdpSessionRevealResult {
                         ok: true,
                         message: format!("已唤起 RDP 会话 {}。", request.session_id),
@@ -740,6 +766,40 @@ pub fn reveal_session(
             ok: false,
             message: "当前平台暂不支持唤起嵌入式 RDP 宿主。".to_string(),
         }
+    }
+}
+
+pub fn capture_session_screenshot(
+    manager: &RdpSessionManager,
+    request: RdpSessionRequest,
+) -> RdpScreenshotResult {
+    let session = match manager.get(&request.session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => return RdpScreenshotResult::failed("RDP 会话不存在或已关闭。"),
+        Err(error) => return RdpScreenshotResult::failed(error.message),
+    };
+
+    #[cfg(windows)]
+    {
+        let Some(hwnd) = session.session_hwnd else {
+            return RdpScreenshotResult::failed("该会话没有可截图的画面窗口。");
+        };
+        match capture_hwnd_png(hwnd) {
+            Ok((data_url, width, height)) => RdpScreenshotResult {
+                ok: true,
+                message: format!("已截取 {width}×{height} 画面。"),
+                data_url: Some(data_url),
+                width,
+                height,
+            },
+            Err(error) => RdpScreenshotResult::failed(error.message),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = session;
+        RdpScreenshotResult::failed("当前平台不支持 RDP 会话截图。")
     }
 }
 
@@ -1902,6 +1962,137 @@ fn resize_hosted_window(
     _parent_hwnd: Option<isize>,
     _bounds: &RdpEmbeddedBounds,
 ) {
+}
+
+/// 截取窗口客户区并编码为 PNG data URL。
+/// 优先 `PrintWindow`（可捕获被遮挡或处于后台的窗口），失败时回退到 `BitBlt`。
+#[cfg(windows)]
+fn capture_hwnd_png(hwnd: isize) -> Result<(String, u32, u32), AppError> {
+    use base64::Engine;
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS, SRCCOPY,
+    };
+    use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, PW_RENDERFULLCONTENT};
+
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut rect) }.map_err(|error| {
+        AppError::new(
+            "rdp_screenshot_bounds_failed",
+            "RDP 画面尺寸读取失败。",
+            error.to_string(),
+            true,
+        )
+    })?;
+    let width = (rect.right - rect.left).max(1) as u32;
+    let height = (rect.bottom - rect.top).max(1) as u32;
+
+    let pixels = unsafe {
+        let screen_dc = GetDC(Some(hwnd));
+        if screen_dc.0.is_null() {
+            return Err(AppError::new(
+                "rdp_screenshot_dc_failed",
+                "RDP 画面设备上下文获取失败。",
+                "GetDC returned null",
+                true,
+            ));
+        }
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let bitmap = CreateCompatibleBitmap(screen_dc, width as i32, height as i32);
+        let previous = SelectObject(mem_dc, bitmap.into());
+
+        if !PrintWindow(
+            hwnd,
+            mem_dc,
+            PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT),
+        )
+        .as_bool() {
+            let _ = BitBlt(
+                mem_dc,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                Some(screen_dc),
+                0,
+                0,
+                SRCCOPY,
+            );
+        }
+
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = width as i32;
+        // 负高度表示 top-down DIB，省掉逐行翻转。
+        info.bmiHeader.biHeight = -(height as i32);
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB.0;
+
+        let mut buffer = vec![0u8; (width as usize) * (height as usize) * 4];
+        let scanned = GetDIBits(
+            mem_dc,
+            bitmap,
+            0,
+            height,
+            Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+
+        let _ = SelectObject(mem_dc, previous);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(Some(hwnd), screen_dc);
+
+        if scanned == 0 {
+            return Err(AppError::new(
+                "rdp_screenshot_read_failed",
+                "RDP 画面像素读取失败。",
+                "GetDIBits returned 0",
+                true,
+            ));
+        }
+
+        buffer
+    };
+
+    // GDI 输出 BGRA，PNG 需要 RGBA。
+    let mut rgba = pixels;
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    }
+
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|error| {
+            AppError::new(
+                "rdp_screenshot_encode_failed",
+                "截图编码失败。",
+                error.to_string(),
+                true,
+            )
+        })?;
+        writer.write_image_data(&rgba).map_err(|error| {
+            AppError::new(
+                "rdp_screenshot_encode_failed",
+                "截图编码失败。",
+                error.to_string(),
+                true,
+            )
+        })?;
+    }
+
+    let base64 = base64::engine::general_purpose::STANDARD.encode(&encoded);
+    Ok((format!("data:image/png;base64,{base64}"), width, height))
 }
 
 #[cfg(windows)]

@@ -495,6 +495,22 @@ export function rdpRevealSession(sessionId: string) {
   });
 }
 
+export interface RdpScreenshotResult {
+  data_url: string | null;
+  height: number;
+  message: string;
+  ok: boolean;
+  width: number;
+}
+
+export function rdpCaptureSessionScreenshot(sessionId: string) {
+  return invoke<RdpScreenshotResult>("rdp_capture_session_screenshot", {
+    request: {
+      session_id: sessionId,
+    },
+  });
+}
+
 export function rdpResizeEmbeddedSession(
   sessionId: string,
   bounds: { x: number; y: number; width: number; height: number },

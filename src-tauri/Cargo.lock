@@ -2969,6 +2969,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "png 0.17.16",
  "portable-pty",
  "primefield",
  "regex",

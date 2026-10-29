@@ -147,6 +147,7 @@ pub fn run() {
             commands::rdp_test_runner,
             commands::rdp_close_session,
             commands::rdp_reveal_session,
+            commands::rdp_capture_session_screenshot,
             commands::rdp_resize_embedded_session,
             commands::vnc_launch_connection,
             commands::vnc_preview_launch,

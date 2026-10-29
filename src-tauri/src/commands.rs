@@ -42,8 +42,8 @@ use crate::network_tools::{
 };
 use crate::rdp::{
     RdpConnectionRequest, RdpLaunchPreview, RdpLaunchResult, RdpResizeRequest,
-    RdpRunnerProbeRequest, RdpRunnerProbeResult, RdpSessionCloseResult, RdpSessionManager,
-    RdpSessionRequest, RdpSessionResizeResult, RdpSessionRevealResult,
+    RdpRunnerProbeRequest, RdpRunnerProbeResult, RdpScreenshotResult, RdpSessionCloseResult,
+    RdpSessionManager, RdpSessionRequest, RdpSessionResizeResult, RdpSessionRevealResult,
 };
 use crate::remote_files::{
     RemoteFileArchiveUploadResult, RemoteFileEntry, RemoteFileEntryMetadata, RemoteFileManager,
@@ -2046,6 +2046,17 @@ pub async fn rdp_reveal_session(
     request: RdpSessionRequest,
 ) -> Result<RdpSessionRevealResult, AppError> {
     Ok(crate::rdp::reveal_session(manager.inner(), request))
+}
+
+#[tauri::command]
+pub async fn rdp_capture_session_screenshot(
+    manager: State<'_, RdpSessionManager>,
+    request: RdpSessionRequest,
+) -> Result<RdpScreenshotResult, AppError> {
+    Ok(crate::rdp::capture_session_screenshot(
+        manager.inner(),
+        request,
+    ))
 }
 
 #[tauri::command]
