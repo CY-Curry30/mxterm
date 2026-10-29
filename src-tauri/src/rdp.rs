@@ -1184,6 +1184,9 @@ fn serialize_rdp_file(
         "use multimon:i:{}",
         if rdp.display.use_multimon { 1 } else { 0 }
     ));
+    // 2 = 始终使用远程键盘钩子。默认值 1 只在全屏时转发 Win 键，
+    // 窗口模式下 Win+E 等组合键会被本地系统消费。
+    lines.push("keyboardhook:i:2".to_string());
     lines.push(format!("session bpp:i:{}", experience.session_bpp));
     lines.push(format!("connection type:i:{}", experience.connection_type));
     lines.push("networkautodetect:i:0".to_string());
@@ -4187,6 +4190,9 @@ fn configure_classic_activex_client(
         put_activex_property_id_optional(&advanced, "SmartSizing", 184, true.into());
         put_activex_property_id_optional(&advanced, "EnableAutoReconnect", 206, true.into());
         put_activex_property_id_optional(&advanced, "GrabFocusOnConnect", 189, true.into());
+        // IMsRdpClientAdvancedSettings::KeyboardHookMode（DISPID 1）。
+        // 0=本地 1=仅全屏 2=始终远程；默认 1 会让窗口模式下的 Win+E 打开本地资源管理器。
+        put_activex_property_id_optional(&advanced, "KeyboardHookMode", 1, 2.into());
         put_activex_property_id_optional(&advanced, "PublicMode", 217, false.into());
         put_activex_property_by_name_optional(
             &advanced,
