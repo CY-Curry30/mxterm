@@ -2,6 +2,7 @@
 .learnings/
 .codem-attachments/
 .playwright-cli/
+.workbuddy-ai/
 .idea/
 logs/
 .tmp-dev/
