@@ -17,6 +17,7 @@ import {
   Copy,
   Folder,
   FolderPlus,
+  House,
   Pencil,
   Play,
   Plus,
@@ -32,6 +33,7 @@ import {
 import { ConfirmDialog } from "../../shared/ui/ConfirmDialog";
 import { Tooltip } from "../../shared/ui/Tooltip";
 import { useEventCallback } from "../../shared/ui/useEventCallback";
+import { LocalTerminalWorkspaceIcon } from "../terminal/LocalTerminalIcons";
 import { ConnectionSystemLogo } from "./ConnectionSystemLogo";
 import type { ConnectionProfile } from "./connectionTypes";
 import { connectionTimestampOf, sortConnectionsByRecent } from "./connectionSearch";
@@ -39,7 +41,9 @@ import { connectionTimestampOf, sortConnectionsByRecent } from "./connectionSear
 interface ConnectionPaneProps {
   connections: ConnectionProfile[];
   error: string | null;
+  homeActive: boolean;
   loading: boolean;
+  localTerminalActive: boolean;
   onCreate: (groupName?: string) => void;
   onConnect: (connection: ConnectionProfile) => void;
   onDelete: (connection: ConnectionProfile) => void | Promise<void>;
@@ -51,6 +55,8 @@ interface ConnectionPaneProps {
   }) => void;
   onMoveConnectionToGroup: (connection: ConnectionProfile, groupName: string | null) => void | Promise<void>;
   onOpen: (connection: ConnectionProfile) => void;
+  onOpenHome: () => void;
+  onOpenLocalTerminal: () => void;
   onOpenSearch: () => void;
   onOpenSettings: () => void;
   onPreloadCreate?: () => void;
@@ -111,7 +117,9 @@ export const ConnectionPane = memo(ConnectionPaneComponent);
 function ConnectionPaneComponent({
   connections,
   error,
+  homeActive,
   loading,
+  localTerminalActive,
   onCreate,
   onConnect,
   onDelete,
@@ -120,6 +128,8 @@ function ConnectionPaneComponent({
   onGroupCatalogChange,
   onMoveConnectionToGroup,
   onOpen,
+  onOpenHome,
+  onOpenLocalTerminal,
   onOpenSearch,
   onOpenSettings,
   onPreloadCreate,
@@ -374,6 +384,30 @@ function ConnectionPaneComponent({
         </section>
 
         <footer className="settings-foot">
+          <Tooltip label="首页">
+            <button
+              className={`icon-button settings-entry-button ${homeActive ? "active" : ""}`}
+              type="button"
+              aria-label="首页"
+              aria-current={homeActive ? "page" : undefined}
+              onClick={onOpenHome}
+            >
+              <House className="ui-icon" aria-hidden="true" />
+              <span>首页</span>
+            </button>
+          </Tooltip>
+          <Tooltip label="终端">
+            <button
+              className={`icon-button settings-entry-button ${localTerminalActive ? "active" : ""}`}
+              type="button"
+              aria-label="终端"
+              aria-current={localTerminalActive ? "page" : undefined}
+              onClick={onOpenLocalTerminal}
+            >
+              <LocalTerminalWorkspaceIcon className="ui-icon" />
+              <span>终端</span>
+            </button>
+          </Tooltip>
           <Tooltip label="设置">
             <button
               className="icon-button settings-entry-button"

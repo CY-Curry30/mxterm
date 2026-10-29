@@ -2818,52 +2818,6 @@ button {
   stroke-width: 1.25;
 }
 
-.title-sidebar-tools {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 4px;
-  overflow: hidden;
-  padding: 0 10px;
-  background: rgb(248 249 251 / 38%);
-}
-
-.title-sidebar-home {
-  height: 28px;
-  border: 0;
-  border-radius: 8px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 9px;
-  color: color-mix(in srgb, var(--mx-muted) 88%, var(--mx-text) 12%);
-  background: transparent;
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1;
-  cursor: pointer;
-}
-
-.title-sidebar-home:hover,
-.title-sidebar-home.active {
-  color: var(--mx-text);
-  background: var(--mx-active);
-}
-
-.title-sidebar-home .title-tool-icon {
-  width: 15px;
-  height: 15px;
-  stroke-width: 1.5;
-}
-
-.app-shell[data-left-collapsed="true"] .title-sidebar-tools {
-  padding: 0;
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-}
-
 .title-session-tabs {
   min-width: 0;
   display: flex;
@@ -3058,14 +3012,12 @@ button {
 }
 
 .settings-foot {
-  flex: 0 0 44px;
-  height: 44px;
-  min-height: 44px;
-  max-height: 44px;
+  flex: 0 0 auto;
   display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  padding: 0 8px 2px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: 6px 8px 8px;
 }
 
 .settings-foot .icon-button.settings-entry-button {
@@ -3078,6 +3030,11 @@ button {
 .settings-foot .icon-button.settings-entry-button:hover,
 .settings-foot .icon-button.settings-entry-button:focus-visible {
   background: var(--mx-sidebar-hover);
+}
+
+.settings-foot .icon-button.settings-entry-button.active {
+  color: var(--mx-text);
+  background: var(--mx-sidebar-active);
 }
 
 .connection-toolbar {
@@ -19061,19 +19018,6 @@ body {
 
 .app-shell[data-platform="macos"][data-left-collapsed="true"] {
   --title-left-width: 118px;
-}
-
-.title-sidebar-tools {
-  background: transparent;
-}
-
-.title-sidebar-home:hover {
-  background: var(--mx-sidebar-hover);
-}
-
-.title-sidebar-home.active {
-  background: var(--mx-sidebar-active);
-  box-shadow: none;
 }
 
 .window-control {

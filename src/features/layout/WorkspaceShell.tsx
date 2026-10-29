@@ -2367,6 +2367,8 @@ export function WorkspaceShell() {
   ) : null;
 
   const connectionPaneActions = {
+    homeActive: showingHome,
+    localTerminalActive: showingLocalTerminal,
     onConnect: useEventCallback(openConnectionSession),
     onCreate: useEventCallback(createConnection),
     onDelete: useEventCallback(deleteConnection),
@@ -2374,6 +2376,8 @@ export function WorkspaceShell() {
     onEdit: useEventCallback(editConnection),
     onMoveConnectionToGroup: useEventCallback(moveConnectionToGroup),
     onOpen: useEventCallback(openTerminal),
+    onOpenHome: useEventCallback(openHome),
+    onOpenLocalTerminal: useEventCallback(openLocalTerminalWorkspace),
     onOpenSearch: useEventCallback(() => setConnectionSearchOpen(true)),
     onOpenSettings: useEventCallback(() => openSettingsSection()),
     onPreloadCreate: useEventCallback(preloadCreateConnectionDialog),
@@ -8871,8 +8875,6 @@ export function WorkspaceShell() {
         onCloseConnectionSession={closeConnectionSession}
         onCloseConnectionSessionsToRight={closeConnectionSessionsToRight}
         onCloseOtherConnectionSessions={closeOtherConnectionSessions}
-        onOpenHome={openHome}
-        onOpenLocalTerminal={openLocalTerminalWorkspace}
         onSelectConnectionSession={(connectionId) => {
           const rdpSession = preferredRdpSessionForConnection(connectionId);
           if (rdpSession) {

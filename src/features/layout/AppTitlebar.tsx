@@ -9,7 +9,6 @@ import type {
 import {
   Download,
   EllipsisVertical,
-  House,
   Search,
   X,
 } from "lucide-react";
@@ -22,7 +21,6 @@ import { Tooltip } from "../../shared/ui/Tooltip";
 import { createMiddleClickCloseHandler } from "../../shared/ui/tabEvents";
 import { hasTauriRuntime } from "../../shared/tauri/runtime";
 import type { ConnectionProfile } from "../connections/connectionTypes";
-import { LocalTerminalWorkspaceIcon } from "../terminal/LocalTerminalIcons";
 
 const windowDragThresholdPx = 4;
 
@@ -53,8 +51,6 @@ interface AppTitlebarProps {
   onCloseConnectionSession: (connectionId: string) => void;
   onCloseConnectionSessionsToRight: (connectionId: string) => void;
   onCloseOtherConnectionSessions: (connectionId: string) => void;
-  onOpenHome: () => void;
-  onOpenLocalTerminal: () => void;
   onSelectConnectionSession: (connectionId: string) => void;
   onToggleLeftPane: () => void;
 }
@@ -71,8 +67,6 @@ export function AppTitlebar({
   onCloseConnectionSession,
   onCloseConnectionSessionsToRight,
   onCloseOtherConnectionSessions,
-  onOpenHome,
-  onOpenLocalTerminal,
   onSelectConnectionSession,
   onToggleLeftPane,
 }: AppTitlebarProps) {
@@ -169,33 +163,6 @@ export function AppTitlebar({
             <SidebarToggleGlyph collapsed={leftPaneCollapsed} />
           </button>
         </Tooltip>
-
-        <div className="title-sidebar-tools">
-          <Tooltip label="首页">
-            <button
-              className={`title-sidebar-home ${homeActive ? "active" : ""}`}
-              type="button"
-              aria-label="首页"
-              aria-current={homeActive ? "page" : undefined}
-              onClick={onOpenHome}
-            >
-              <HomeGlyph />
-              <span>首页</span>
-            </button>
-          </Tooltip>
-          <Tooltip label="终端">
-            <button
-              className={`title-sidebar-home ${localTerminalActive ? "active" : ""}`}
-              type="button"
-              aria-label="终端"
-              aria-current={localTerminalActive ? "page" : undefined}
-              onClick={onOpenLocalTerminal}
-            >
-              <LocalTerminalWorkspaceIcon className="title-tool-icon" />
-              <span>终端</span>
-            </button>
-          </Tooltip>
-        </div>
       </div>
 
       <nav ref={titleTabsRef} className="title-session-tabs" aria-label="工作区标签">
@@ -897,10 +864,6 @@ function SidebarToggleGlyph({ collapsed }: { collapsed: boolean }) {
       <rect x={railX} y="6.25" width="3" height="7.5" rx="1" fill="currentColor" stroke="none" />
     </svg>
   );
-}
-
-function HomeGlyph() {
-  return <House className="title-tool-icon" aria-hidden="true" />;
 }
 
 function MinimizeGlyph() {
