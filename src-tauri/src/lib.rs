@@ -39,7 +39,20 @@ use storage_vault::VaultState;
 use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // 单实例插件必须最先注册，才能在其他插件和窗口初始化前拦截第二次启动。
+    // 第二次启动只聚焦已运行的主窗口，不再创建新进程，避免多实例并发写 mxterm.db 和凭据库。
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        if let Err(error) = tray::show_main_window(app) {
+            eprintln!(
+                "[single-instance] focus main window failed: {}",
+                error.raw_message
+            );
+        }
+    }));
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())

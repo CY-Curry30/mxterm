@@ -100,7 +100,7 @@ pub fn set_close_to_tray_enabled(
     Ok(())
 }
 
-fn show_main_window(app: &AppHandle) -> Result<(), AppError> {
+pub(crate) fn show_main_window(app: &AppHandle) -> Result<(), AppError> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| AppError::new("main_window_not_found", "主窗口不存在", "main", true))?;
