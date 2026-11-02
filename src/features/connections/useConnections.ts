@@ -720,7 +720,8 @@ function normalizeRdpConfig(input?: RdpConnectionConfig | null): RdpConnectionCo
   const trim = (value: string | undefined | null) => value?.trim() || undefined;
   const gatewayMode = rdp.gateway?.mode || "disabled";
   const remoteAppEnabled = Boolean(rdp.remote_app?.enabled);
-  const renderMode = rdp.runner?.render_mode === "external" ? "external" : "embedded";
+  // 尊重用户显式选择；旧配置缺少 runner 时沿用默认的嵌入式 ActiveX 模式。
+  const renderMode = rdp.runner?.render_mode || defaultRdpConfig.runner.render_mode;
   const externalRunner = defaultRdpExternalRunnerForPlatform(resolveDesktopPlatform());
   const displayMode =
     rdp.display?.mode === "windowed" ? defaultRdpConfig.display.mode : rdp.display?.mode;
@@ -742,6 +743,8 @@ function normalizeRdpConfig(input?: RdpConnectionConfig | null): RdpConnectionCo
       drives: Boolean(rdp.resources?.drives),
       printers: Boolean(rdp.resources?.printers),
       smart_cards: Boolean(rdp.resources?.smart_cards),
+      keyboard_hook_mode:
+        rdp.resources?.keyboard_hook_mode || defaultRdpConfig.resources.keyboard_hook_mode,
     },
     gateway:
       gatewayMode === "disabled"

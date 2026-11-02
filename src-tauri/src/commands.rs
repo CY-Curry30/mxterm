@@ -42,8 +42,8 @@ use crate::network_tools::{
 };
 use crate::rdp::{
     RdpConnectionRequest, RdpLaunchPreview, RdpLaunchResult, RdpResizeRequest,
-    RdpRunnerProbeRequest, RdpRunnerProbeResult, RdpScreenshotResult, RdpSessionCloseResult,
-    RdpSessionManager, RdpSessionRequest, RdpSessionResizeResult, RdpSessionRevealResult,
+    RdpRunnerProbeRequest, RdpRunnerProbeResult, RdpSessionCloseResult, RdpSessionManager,
+    RdpSessionRequest, RdpSessionResizeResult, RdpSessionRevealResult,
 };
 use crate::remote_files::{
     RemoteFileArchiveUploadResult, RemoteFileEntry, RemoteFileEntryMetadata, RemoteFileManager,
@@ -2016,9 +2016,10 @@ pub async fn rdp_preview_launch(
 
 #[tauri::command]
 pub async fn rdp_test_runner(
+    app: AppHandle,
     request: RdpRunnerProbeRequest,
 ) -> Result<RdpRunnerProbeResult, AppError> {
-    crate::rdp::probe_runner(request)
+    crate::rdp::probe_runner(&app, request)
 }
 
 #[tauri::command]
@@ -2046,17 +2047,6 @@ pub async fn rdp_reveal_session(
     request: RdpSessionRequest,
 ) -> Result<RdpSessionRevealResult, AppError> {
     Ok(crate::rdp::reveal_session(manager.inner(), request))
-}
-
-#[tauri::command]
-pub async fn rdp_capture_session_screenshot(
-    manager: State<'_, RdpSessionManager>,
-    request: RdpSessionRequest,
-) -> Result<RdpScreenshotResult, AppError> {
-    Ok(crate::rdp::capture_session_screenshot(
-        manager.inner(),
-        request,
-    ))
 }
 
 #[tauri::command]

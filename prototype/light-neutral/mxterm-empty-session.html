@@ -6509,5 +6509,99 @@ enablecredsspsupport:i:1</textarea>
       aiContextPreview.hidden = true;
     });
   </script>
+  <!-- Open with ?preview=rdp to review the native host's tab interactions. -->
+  <style>
+    .rdp-host-preview { position: fixed; inset: 8vh 5vw; z-index: 100; display: grid; grid-template-rows: 40px minmax(0, 1fr); border: 1px solid var(--mx-line); border-radius: 8px; overflow: hidden; background: var(--mx-panel); }
+    .rdp-host-preview[hidden] { display: none; }
+    .rdp-host-preview-chrome { display: flex; align-items: center; gap: 4px; padding-left: 12px; border-bottom: 1px solid var(--mx-chrome-line); background: var(--mx-chrome-fill); }
+    .rdp-host-preview-brand { flex: 0 0 64px; color: var(--mx-muted); font-size: 11px; font-weight: 650; }
+    .rdp-host-preview-tabs { display: flex; gap: 4px; flex: 1; min-width: 0; }
+    .rdp-host-preview-tab { position: relative; display: flex; flex: 1; min-width: 0; max-width: 200px; height: 30px; border: 1px solid transparent; border-radius: 6px; }
+    .rdp-host-preview-tab[aria-selected="true"] { border-color: var(--mx-line); background: var(--mx-panel); }
+    .rdp-host-preview-tab:hover { background: var(--mx-active); }
+    .rdp-host-preview-tab[aria-selected="true"]::after { content: ""; position: absolute; bottom: 0; left: 12px; right: 12px; height: 2px; background: var(--mx-primary); }
+    .rdp-host-preview-tab button { border: 0; color: var(--mx-muted); background: transparent; }
+    .rdp-host-preview-tab[aria-selected="true"] button { color: var(--mx-text); }
+    .rdp-host-preview-select { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; padding: 0 8px; font-size: 12px; text-align: left; }
+    .rdp-host-preview-select span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rdp-host-preview-state { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: var(--mx-success); }
+    .rdp-host-preview-close { width: 26px; padding: 0; border-radius: 4px; }
+    .rdp-host-preview-close:hover { background: var(--mx-active); }
+    .rdp-host-preview-overflow { width: 32px; height: 30px; border: 0; border-radius: 6px; color: var(--mx-muted); background: transparent; }
+    .rdp-host-preview-overflow:hover { background: var(--mx-active); }
+    .rdp-host-preview-drag { flex: 0 0 24px; }
+    .rdp-host-preview .window-controls { height: 40px; }
+    .rdp-host-preview-menu { position: absolute; top: 42px; right: 164px; width: 280px; max-height: 320px; overflow: auto; padding: 4px; border: 1px solid var(--mx-line); border-radius: 6px; background: var(--mx-panel); }
+    .rdp-host-preview-menu button { display: block; width: 100%; border: 0; border-radius: 4px; padding: 8px; color: var(--mx-text); background: transparent; text-align: left; }
+    .rdp-host-preview-menu button:hover { background: var(--mx-active); }
+    .rdp-host-preview-desktop { display: grid; place-content: center; gap: 12px; text-align: center; background: var(--mx-bg); }
+    .rdp-host-preview-desktop strong { font-size: 20px; font-weight: 550; }
+    .rdp-host-preview-desktop p { margin: 0; color: var(--mx-muted); font-size: 13px; }
+    .rdp-host-preview-tools { display: flex; justify-content: center; gap: 8px; margin-top: 12px; }
+    .rdp-host-preview-tools button { border: 1px solid var(--mx-line); border-radius: 6px; padding: 6px 10px; background: var(--mx-panel); color: var(--mx-text); }
+  </style>
+  <section class="rdp-host-preview app-shell" id="rdpHostPreview" data-platform="windows" data-window-material="auto" data-theme-mode="light" aria-label="RDP 多标签宿主原型" hidden>
+    <header class="rdp-host-preview-chrome">
+      <span class="rdp-host-preview-brand">mXterm RDP</span>
+      <nav class="rdp-host-preview-tabs" role="tablist" aria-label="远程桌面连接"></nav>
+      <button class="rdp-host-preview-overflow" type="button" aria-label="其他 RDP 连接" aria-haspopup="menu" aria-expanded="false">⋯</button>
+      <span class="rdp-host-preview-drag"></span>
+      <div class="window-controls" aria-hidden="true"><span class="window-control">−</span><span class="window-control">□</span><span class="window-control">×</span></div>
+    </header>
+    <div class="rdp-host-preview-menu" role="menu" hidden></div>
+    <div class="rdp-host-preview-desktop" role="tabpanel" aria-live="polite">
+      <strong id="rdpHostPreviewTitle"></strong>
+      <p>远程桌面 · 会话在切换时保持连接</p>
+      <p>从主窗口连接列表打开其他 RDP，自动加入此窗口。</p>
+      <div class="rdp-host-preview-tools"><button type="button" data-rdp-demo="open">模拟从主窗口打开连接</button><button type="button" data-rdp-demo="theme">切换亮 / 暗色</button></div>
+    </div>
+  </section>
+  <script>
+    (() => {
+      const host = document.getElementById("rdpHostPreview");
+      if (new URLSearchParams(location.search).get("preview") !== "rdp") return;
+      const themeTokens = document.createElement("link"); themeTokens.rel = "stylesheet"; themeTokens.href = "../../src/styles/tokens.css"; document.head.append(themeTokens);
+      host.hidden = false;
+      const tabs = host.querySelector('[role="tablist"]');
+      const menu = host.querySelector('[role="menu"]');
+      const overflow = host.querySelector(".rdp-host-preview-overflow");
+      let sequence = 8;
+      let sessions = Array.from({ length: sequence }, (_, i) => ({ id: i, title: ["开发桌面", "测试环境", "应用服务器", "运维桌面", "构建节点", "预发布环境", "数据库管理", "远程办公桌面"][i] }));
+      let active = 0;
+      function activate(id) { active = id; menu.hidden = true; render(); }
+      function close(id) {
+        const index = sessions.findIndex(s => s.id === id);
+        sessions = sessions.filter(s => s.id !== id);
+        if (active === id) active = sessions[Math.min(index, sessions.length - 1)]?.id;
+        render();
+      }
+      function render() {
+        const capacity = Math.max(1, Math.min(5, Math.floor((tabs.clientWidth - 36) / 144)));
+        const visible = sessions.slice(0, capacity);
+        const current = sessions.find(s => s.id === active);
+        if (current && !visible.includes(current)) visible[visible.length - 1] = current;
+        const hidden = sessions.filter(s => !visible.includes(s));
+        tabs.replaceChildren(); menu.replaceChildren();
+        for (const session of visible) {
+          const tab = document.createElement("div"); tab.className = "rdp-host-preview-tab"; tab.setAttribute("role", "tab"); tab.setAttribute("aria-selected", String(session.id === active));
+          const select = document.createElement("button"); select.type = "button"; select.className = "rdp-host-preview-select"; select.title = `${session.title} · 已连接`;
+          const dot = document.createElement("i"); dot.className = "rdp-host-preview-state"; dot.setAttribute("aria-hidden", "true");
+          const label = document.createElement("span"); label.textContent = session.title; select.append(dot, label); select.onclick = () => activate(session.id);
+          const remove = document.createElement("button"); remove.type = "button"; remove.className = "rdp-host-preview-close"; remove.textContent = "×"; remove.setAttribute("aria-label", `关闭 ${session.title}`); remove.onclick = () => close(session.id);
+          tab.onauxclick = event => { if (event.button === 1) { event.preventDefault(); close(session.id); } }; tab.append(select, remove); tabs.append(tab);
+        }
+        for (const session of hidden) { const item = document.createElement("button"); item.type = "button"; item.setAttribute("role", "menuitem"); item.textContent = `${session.title} · 已连接`; item.onclick = () => activate(session.id); menu.append(item); }
+        overflow.hidden = hidden.length === 0; overflow.setAttribute("aria-expanded", String(!menu.hidden));
+        document.getElementById("rdpHostPreviewTitle").textContent = current?.title || "所有连接已关闭";
+      }
+      overflow.onclick = () => { menu.hidden = !menu.hidden; overflow.setAttribute("aria-expanded", String(!menu.hidden)); };
+      host.querySelector('[data-rdp-demo="open"]').onclick = () => { const session = { id: sequence++, title: `新增远程桌面 ${sequence}` }; sessions.push(session); activate(session.id); };
+      host.querySelector('[data-rdp-demo="theme"]').onclick = () => { host.dataset.themeMode = host.dataset.themeMode === "dark" ? "light" : "dark"; };
+      document.addEventListener("click", event => { if (!menu.contains(event.target) && event.target !== overflow) { menu.hidden = true; overflow.setAttribute("aria-expanded", "false"); } });
+      host.addEventListener("keydown", event => { if (event.key === "Escape") { menu.hidden = true; overflow.focus(); overflow.setAttribute("aria-expanded", "false"); } });
+      new ResizeObserver(render).observe(tabs);
+      render();
+    })();
+  </script>
 </body>
 </html>

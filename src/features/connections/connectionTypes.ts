@@ -80,12 +80,17 @@ export interface RdpDisplayConfig {
   use_multimon: boolean;
 }
 
+/** 对应 mstsc「本地资源 → 键盘 → 应用 Windows 组合键」三档设置。 */
+export type RdpKeyboardHookMode = "local" | "remote" | "fullscreen_only";
+
 export interface RdpResourceConfig {
   clipboard: boolean;
   audio: RdpAudioMode;
   drives: boolean;
   printers: boolean;
   smart_cards: boolean;
+  /** 应用 Windows 组合键的方式，默认 remote（窗口模式也转发到远程）。 */
+  keyboard_hook_mode: RdpKeyboardHookMode;
 }
 
 export interface RdpGatewayConfig {
@@ -560,6 +565,8 @@ export const defaultRdpConfig: RdpConnectionConfig = {
     drives: false,
     printers: false,
     smart_cards: false,
+    // 默认「在远程计算机上」：窗口模式下 Win+E / Alt+Tab 也进远程。
+    keyboard_hook_mode: "remote",
   },
   gateway: {
     mode: "disabled",

@@ -44,6 +44,7 @@ import type {
   RdpConnectionConfig,
   RdpDisplayMode,
   RdpGatewayMode,
+  RdpKeyboardHookMode,
   RdpNetworkLevelAuthentication,
   RdpPerformancePreset,
   RdpRenderMode,
@@ -223,6 +224,13 @@ const rdpAudioOptions: Array<{ label: string; value: RdpAudioMode }> = [
   { label: "禁用", value: "disabled" },
 ];
 
+/** 与 mstsc「本地资源 → 键盘 → 应用 Windows 组合键」一一对应。 */
+const rdpKeyboardHookModeOptions: Array<{ label: string; value: RdpKeyboardHookMode }> = [
+  { label: "在这台计算机上", value: "local" },
+  { label: "在远程计算机上", value: "remote" },
+  { label: "仅在全屏显示时", value: "fullscreen_only" },
+];
+
 const rdpGatewayOptions: Array<{ label: string; value: RdpGatewayMode }> = [
   { label: "关闭", value: "disabled" },
   { label: "自动", value: "auto" },
@@ -347,6 +355,7 @@ export function ConnectionDialog({
     () => {
       const options: Array<{ label: string; value: RdpRenderMode }> = [];
       if (platformCapabilities.supportsEmbeddedRdp) {
+        // 内置宿主优先使用支持 SecuredSettings.KeyboardHookMode 的经典 MSTSC ActiveX。
         options.push({ label: "内置宿主", value: "embedded" });
       }
       options.push({
@@ -1936,6 +1945,12 @@ export function ConnectionDialog({
               />
             </label>
           </div>
+          {runnerRenderMode === "embedded" ? (
+            <p className="connection-dialog-note">
+              内置宿主优先使用支持键盘钩子的经典 MSTSC ActiveX；如果系统无法确认该设置，
+              将自动回退到外部 mstsc.exe 窗口。
+            </p>
+          ) : null}
           <div className="form-grid form-grid-wide">
             <label>
               <span>分辨率</span>
@@ -2021,7 +2036,26 @@ export function ConnectionDialog({
                 }
               />
             </label>
+            <label>
+              <span>应用 Windows 组合键</span>
+              <AppSelect
+                ariaLabel="RDP 应用 Windows 组合键"
+                value={rdp.resources.keyboard_hook_mode}
+                options={rdpKeyboardHookModeOptions}
+                onChange={(keyboard_hook_mode) =>
+                  updateRdp({
+                    resources: {
+                      ...rdp.resources,
+                      keyboard_hook_mode,
+                    },
+                  })
+                }
+              />
+            </label>
           </div>
+          <p className="connection-dialog-note">
+            选「在远程计算机上」时，Win+E、Alt+Tab 等系统组合键在窗口模式下也会发送到远程会话。
+          </p>
           <div className="connection-dialog-checks">
             {[
               ["clipboard", "剪贴板"],

@@ -56,7 +56,6 @@ export interface BasicSettings {
   autoCheckAppUpdate: boolean;
   closeWindowToTray: boolean;
   filePanelFollowsActiveConnection: boolean;
-  forwardWindowsKeysToRemote: boolean;
   keepFailedTerminalTabs: boolean;
   reopenLastTerminal: boolean;
   remoteFileOpenMode: RemoteFileOpenMode;
@@ -223,7 +222,6 @@ export const defaultSettings: MxtermSettings = {
     autoCheckAppUpdate: true,
     closeWindowToTray: true,
     filePanelFollowsActiveConnection: true,
-    forwardWindowsKeysToRemote: true,
     keepFailedTerminalTabs: true,
     reopenLastTerminal: false,
     remoteFileOpenMode: "split",
@@ -314,10 +312,6 @@ export function normalizeSettings(value: unknown): MxtermSettings {
       filePanelFollowsActiveConnection: normalizeBoolean(
         basic.filePanelFollowsActiveConnection,
         defaultSettings.basic.filePanelFollowsActiveConnection,
-      ),
-      forwardWindowsKeysToRemote: normalizeBoolean(
-        basic.forwardWindowsKeysToRemote,
-        defaultSettings.basic.forwardWindowsKeysToRemote,
       ),
       keepFailedTerminalTabs: normalizeBoolean(
         basic.keepFailedTerminalTabs,

@@ -2973,19 +2973,6 @@ function BasicSettingsSection({
           />
         </SettingsRow>
         <SettingsRow
-          icon={Monitor}
-          title="转发 Windows 快捷键到远程"
-          description="开启后，Win 键与系统组合键（Win+E、Win+R、Ctrl+C 等）在聚焦 RDP 远程窗口时会发送到远程会话；关闭则保留在本地。"
-        >
-          <SettingsToggle
-            checked={settings.forwardWindowsKeysToRemote}
-            label="转发 Windows 快捷键到远程"
-            onChange={(forwardWindowsKeysToRemote) =>
-              onUpdate({ forwardWindowsKeysToRemote })
-            }
-          />
-        </SettingsRow>
-        <SettingsRow
           icon={Server}
           title="保留失败页"
           description="连接失败时保留当前会话页，方便查看原因、重试或编辑连接。"

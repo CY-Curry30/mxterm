@@ -219,6 +219,39 @@ impl Default for RdpDisplayConfig {
     }
 }
 
+/// 对应 mstsc「本地资源 → 键盘 → 应用 Windows 组合键」的三档设置。
+///
+/// 取值与 `.rdp` 的 `keyboardhook:i:` 一致：
+/// `0` 在这台计算机上、`1` 在远程计算机上、`2` 仅在全屏显示时（mstsc 默认）。
+/// 窗口模式下要让 Win+E / Alt+Tab 进远程，必须用 `1`。
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RdpKeyboardHookMode {
+    /// 在这台计算机上：组合键全部留给本地。
+    Local,
+    /// 在远程计算机上：窗口模式和全屏都转发到远程。
+    Remote,
+    /// 仅在全屏显示时：窗口模式下组合键仍留在本地。
+    FullscreenOnly,
+}
+
+impl Default for RdpKeyboardHookMode {
+    fn default() -> Self {
+        Self::Remote
+    }
+}
+
+impl RdpKeyboardHookMode {
+    /// `.rdp` 文件 `keyboardhook:i:` 的取值。
+    pub fn as_rdp_value(self) -> i32 {
+        match self {
+            Self::Local => 0,
+            Self::Remote => 1,
+            Self::FullscreenOnly => 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RdpResourceConfig {
     #[serde(default = "default_true")]
@@ -231,6 +264,9 @@ pub struct RdpResourceConfig {
     pub printers: bool,
     #[serde(default)]
     pub smart_cards: bool,
+    /// 应用 Windows 组合键的方式（对应 mstsc 的键盘选项）。
+    #[serde(default)]
+    pub keyboard_hook_mode: RdpKeyboardHookMode,
 }
 
 impl Default for RdpResourceConfig {
@@ -241,6 +277,7 @@ impl Default for RdpResourceConfig {
             drives: false,
             printers: false,
             smart_cards: false,
+            keyboard_hook_mode: RdpKeyboardHookMode::Remote,
         }
     }
 }

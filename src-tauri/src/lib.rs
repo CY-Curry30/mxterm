@@ -147,7 +147,6 @@ pub fn run() {
             commands::rdp_test_runner,
             commands::rdp_close_session,
             commands::rdp_reveal_session,
-            commands::rdp_capture_session_screenshot,
             commands::rdp_resize_embedded_session,
             commands::vnc_launch_connection,
             commands::vnc_preview_launch,
@@ -274,6 +273,11 @@ pub fn run() {
             ai_assistant::ai_chat_tool_answer,
             ai_assistant::ai_command_assess,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<rdp::RdpSessionManager>().shutdown();
+            }
+        });
 }

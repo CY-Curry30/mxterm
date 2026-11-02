@@ -22,7 +22,6 @@ import type { IWindowsPty } from "@xterm/xterm";
 import {
   AlertTriangle,
   BringToFront,
-  Camera,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -356,7 +355,6 @@ import {
   remoteFileWrite,
   dockerExecInvalidateConnection,
   rdpCloseSession,
-  rdpCaptureSessionScreenshot,
   rdpLaunchConnection,
   rdpPreviewLaunch,
   rdpRevealSession,
@@ -506,17 +504,8 @@ interface RdpSessionTab {
   message?: string | null;
   preview?: RdpLaunchPreview | null;
   result?: RdpLaunchResult | null;
-  /** 最近一次手动截图（data:image/png;base64,...）。 */
-  screenshot?: RdpScreenshot | null;
   status: RdpSessionStatus;
   title: string;
-}
-
-interface RdpScreenshot {
-  capturedAt: number;
-  dataUrl: string;
-  height: number;
-  width: number;
 }
 
 type VncSessionStatus = "launching" | "embedded" | "windowed" | "external" | "error";
@@ -7024,11 +7013,7 @@ export function WorkspaceShell() {
     }
 
     try {
-      const result = await rdpLaunchConnection(
-        connection.id,
-        null,
-        settings.basic.forwardWindowsKeysToRemote,
-      );
+      const result = await rdpLaunchConnection(connection.id, null);
       if (!rdpSessionExists(sessionId)) {
         if (result.session_id) {
           await rdpCloseSession(result.session_id).catch(() => undefined);
@@ -7095,63 +7080,6 @@ export function WorkspaceShell() {
       updateRdpSession(sessionId, (current) => ({
         ...current,
         message: `启动预览失败：${formatError(error)}`,
-      }));
-    }
-  }
-
-  async function captureRdpSessionScreenshot(sessionId: string) {
-    const session = rdpSessionsRef.current.find((item) => item.id === sessionId);
-    if (!session) {
-      return;
-    }
-    if (!hasTauriRuntime()) {
-      updateRdpSession(sessionId, (current) => ({
-        ...current,
-        message: "浏览器预览模式不支持截取会话画面。",
-      }));
-      return;
-    }
-    const backendSessionId = session.result?.session_id;
-    if (!backendSessionId) {
-      updateRdpSession(sessionId, (current) => ({
-        ...current,
-        message: "会话尚未启动，无法截图。",
-      }));
-      return;
-    }
-
-    updateRdpSession(sessionId, (current) => ({
-      ...current,
-      message: "正在截取会话画面。",
-    }));
-
-    try {
-      const result = await rdpCaptureSessionScreenshot(backendSessionId);
-      if (!rdpSessionExists(sessionId)) {
-        return;
-      }
-      const dataUrl = result.data_url;
-      if (!result.ok || !dataUrl) {
-        updateRdpSession(sessionId, (current) => ({
-          ...current,
-          message: result.message || "截图失败。",
-        }));
-        return;
-      }
-      updateRdpSession(sessionId, (current) => ({
-        ...current,
-        message: result.message,
-        screenshot: {
-          capturedAt: Date.now(),
-          dataUrl,
-          height: result.height,
-          width: result.width,
-        },
-      }));
-    } catch (error) {
-      updateRdpSession(sessionId, (current) => ({
-        ...current,
-        message: `截图失败：${formatError(error)}`,
       }));
     }
   }
@@ -9620,7 +9548,6 @@ export function WorkspaceShell() {
                       onCopyCommand={() => void copyText(rdpSessionCommandText(session))}
                       onCopyRdpFile={() => void copyText(rdpSessionFileText(session))}
                       onRetry={() => retryRdpSession(session.id)}
-                      onScreenshot={() => void captureRdpSessionScreenshot(session.id)}
                       onWake={() => revealNativeRdpHostSession(session)}
                     />
                   ))}
@@ -10691,7 +10618,6 @@ function RdpSessionStatusPanel({
   onCopyCommand,
   onCopyRdpFile,
   onRetry,
-  onScreenshot,
   onWake,
 }: {
   active: boolean;
@@ -10707,7 +10633,6 @@ function RdpSessionStatusPanel({
   onCopyCommand: () => void;
   onCopyRdpFile: () => void;
   onRetry: () => void;
-  onScreenshot: () => void;
   onWake: () => void;
 }) {
   const embeddedViewportRef = useRef<HTMLDivElement | null>(null);
@@ -10719,8 +10644,6 @@ function RdpSessionStatusPanel({
   // 只有 MXterm 自建的 ActiveX 宿主窗口才能被置前，外部 mstsc 进程由系统管理。
   const canWake =
     session.result?.runner === "mstsc_activex" && Boolean(session.result?.session_id);
-  // 截图需要后端会话已建立并拿到画面窗口句柄。
-  const canScreenshot = Boolean(session.result?.session_id);
   const setEmbeddedViewport = useCallback(
     (node: HTMLDivElement | null) => {
       embeddedViewportRef.current = node;
@@ -10786,10 +10709,6 @@ function RdpSessionStatusPanel({
             </span>
           </div>
           <div className="rdp-session-actions">
-            <button type="button" disabled={!canScreenshot} onClick={onScreenshot}>
-              <Camera className="ui-icon" aria-hidden="true" />
-              <span>截图</span>
-            </button>
             <button type="button" disabled={!hasCommand} onClick={onCopyCommand}>
               <Clipboard className="ui-icon" aria-hidden="true" />
               <span>命令</span>
@@ -10846,20 +10765,6 @@ function RdpSessionStatusPanel({
           </div>
         ) : (
           <div className="rdp-session-preview-grid">
-            {session.screenshot ? (
-              <section className="rdp-session-preview-card">
-                <strong>会话截图</strong>
-                <img
-                  alt={`${session.title} 画面截图`}
-                  className="rdp-session-screenshot"
-                  src={session.screenshot.dataUrl}
-                />
-                <small>
-                  {session.screenshot.width}×{session.screenshot.height} ·{" "}
-                  {new Date(session.screenshot.capturedAt).toLocaleTimeString()}
-                </small>
-              </section>
-            ) : null}
             <section className="rdp-session-preview-card">
               <strong>{primaryDetail.title}</strong>
               <code>{primaryDetail.value}</code>

@@ -11601,17 +11601,6 @@ button {
   background: color-mix(in srgb, var(--mx-panel-soft) 88%, var(--mx-panel));
 }
 
-.rdp-session-screenshot {
-  display: block;
-  width: 100%;
-  height: auto;
-  max-height: 420px;
-  border: 1px solid var(--mx-line-soft);
-  border-radius: 6px;
-  object-fit: contain;
-  background: var(--mx-panel-soft);
-}
-
 .rdp-session-preview-card strong,
 .rdp-tool-preview strong {
   color: var(--mx-text);

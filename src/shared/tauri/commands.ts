@@ -455,7 +455,6 @@ export function connectionTestProfile(request: ConnectionProfileInput) {
 export async function rdpLaunchConnection(
   connectionId: string,
   bounds?: RdpEmbeddedBounds | null,
-  forwardWindowsKeys?: boolean,
 ) {
   const { readNativeAppearance } = await import("../ui/nativeAppearance");
   return invoke<RdpLaunchResult>("rdp_launch_connection", {
@@ -463,7 +462,6 @@ export async function rdpLaunchConnection(
       connection_id: connectionId,
       bounds: bounds ?? undefined,
       appearance: readNativeAppearance(),
-      forward_windows_keys: forwardWindowsKeys,
     },
   });
 }
@@ -494,22 +492,6 @@ export function rdpCloseSession(sessionId: string) {
 
 export function rdpRevealSession(sessionId: string) {
   return invoke<RdpSessionRevealResult>("rdp_reveal_session", {
-    request: {
-      session_id: sessionId,
-    },
-  });
-}
-
-export interface RdpScreenshotResult {
-  data_url: string | null;
-  height: number;
-  message: string;
-  ok: boolean;
-  width: number;
-}
-
-export function rdpCaptureSessionScreenshot(sessionId: string) {
-  return invoke<RdpScreenshotResult>("rdp_capture_session_screenshot", {
     request: {
       session_id: sessionId,
     },
