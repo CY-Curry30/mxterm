@@ -5,6 +5,7 @@ import type {
   DockerLogStreamEvent,
 } from "../../features/tools/dockerTypes";
 import type {
+  RdpSessionActivatedEvent,
   RdpSessionClosedEvent,
   VncRunnerWindowMessageEvent,
   VncRunnerWindowPayload,
@@ -60,6 +61,14 @@ export function listenDockerLogStream(handler: (event: DockerLogStreamEvent) => 
 
 export function listenRdpSessionClosed(handler: (event: RdpSessionClosedEvent) => void) {
   return listen<RdpSessionClosedEvent>("rdp:session_closed", (event) => handler(event.payload));
+}
+
+// 用户从任务栏缩略图激活了被移到屏外的 RDP 宿主窗口，工作区需要把对应标签
+// 切回前台并重新对齐宿主位置。
+export function listenRdpSessionActivated(handler: (event: RdpSessionActivatedEvent) => void) {
+  return listen<RdpSessionActivatedEvent>("rdp:session_activated", (event) =>
+    handler(event.payload),
+  );
 }
 
 export function listenAiChatStream(handler: (event: AiChatStreamEvent) => void) {

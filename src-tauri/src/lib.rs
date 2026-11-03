@@ -37,8 +37,29 @@ mod webdav;
 mod webdav_sync;
 use storage_vault::VaultState;
 use tauri::Manager;
+
+// 任务栏分组标识：必须与 tauri.conf.json 的 bundle identifier 一致，安装器给
+// 快捷方式写入的 AppUserModelID 也是这个值。主进程与 RDP 宿主进程共用它，
+// 才能合并为一个任务栏按钮，并在悬停时同时列出主窗口和远程桌面窗口。
+#[cfg(windows)]
+pub(crate) const APP_USER_MODEL_ID: &str = "com.mxterm.app";
+
+#[cfg(windows)]
+fn apply_app_user_model_id() {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    // 必须在创建任何窗口之前调用，任务栏会在窗口首次显示时读取该身份。
+    if let Err(error) =
+        unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_USER_MODEL_ID)) }
+    {
+        eprintln!("[app] failed to set AppUserModelID: {error}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    apply_app_user_model_id();
     let builder = tauri::Builder::default();
     // 单实例插件必须最先注册，才能在其他插件和窗口初始化前拦截第二次启动。
     // 第二次启动只聚焦已运行的主窗口，不再创建新进程，避免多实例并发写 mxterm.db 和凭据库。
@@ -280,4 +301,19 @@ pub fn run() {
                 app.state::<rdp::RdpSessionManager>().shutdown();
             }
         });
+}
+
+#[cfg(all(test, windows))]
+mod app_user_model_id_tests {
+    #[test]
+    fn app_user_model_id_matches_bundle_identifier() {
+        // 安装器按 bundle identifier 写快捷方式 AUMID；两者漂移会让任务栏
+        // 重新拆成两个图标，这里在编译期资产上做一次一致性校验。
+        let config = include_str!("../tauri.conf.json");
+        let expected = format!("\"identifier\": \"{}\"", crate::APP_USER_MODEL_ID);
+        assert!(
+            config.contains(&expected),
+            "APP_USER_MODEL_ID 必须与 tauri.conf.json 的 identifier 保持一致"
+        );
+    }
 }

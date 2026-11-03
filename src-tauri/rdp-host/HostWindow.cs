@@ -150,12 +150,6 @@ namespace MXterm.RdpHost
         internal HostWindow()
         {
             Text = "MXterm RDP";
-            // The host is the native surface for a workbench pane, not a second
-            // application: an unowned top-level Form would get its own taskbar
-            // button (and Alt+Tab entry) next to the main window. The explicit
-            // CreateParams flag below is authoritative; this property documents
-            // the intent and keeps WinForms' own taskbar bookkeeping in sync.
-            ShowInTaskbar = false;
             AutoScaleMode = AutoScaleMode.None;
             MinimumSize = new Size(720, 480);
             Size = new Size(1280, 860);
@@ -174,20 +168,6 @@ namespace MXterm.RdpHost
             SynchronizeChrome();
             maintenance.Tick += delegate { MaintainSessions(); };
             maintenance.Start();
-        }
-
-        protected override CreateParams CreateParams
-        {
-            get
-            {
-                // WS_EX_TOOLWINDOW is the only style Win32 honours when keeping a
-                // top-level window out of the taskbar and the Alt+Tab list. It is
-                // applied at handle creation and survives handle recreation, so
-                // the host can never flash a second taskbar button.
-                CreateParams parameters = base.CreateParams;
-                parameters.ExStyle |= Native.WsExToolWindow;
-                return parameters;
-            }
         }
 
         protected override void SetVisibleCore(bool value) { base.SetVisibleCore(value && allowShow); }
@@ -579,7 +559,20 @@ namespace MXterm.RdpHost
             active.Ax.Focus();
         }
 
-        protected override void OnActivated(EventArgs e) { base.OnActivated(e); FocusActiveSession(); }
+        protected override void OnActivated(EventArgs e)
+        {
+            base.OnActivated(e);
+            FocusActiveSession();
+            NotifyTaskbarActivation();
+        }
+
+        // 其他标签在前台时宿主被移到屏幕外等待；用户从任务栏缩略图选中它时，
+        // 需要通知工作区切回该会话，否则激活的是一个看不见的窗口。
+        private void NotifyTaskbarActivation()
+        {
+            if (closing || active == null || Left > -30000) return;
+            Protocol.Write(new { @event = "activated", session_id = active.Id });
+        }
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);

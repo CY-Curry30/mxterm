@@ -221,7 +221,6 @@ namespace MXterm.RdpHost
         }
         internal const int ExtendedStyleIndex = -20;
         internal const int WsExToolWindow = 0x00000080;
-        internal const int WsExAppWindow = 0x00040000;
 
         [DllImport("user32.dll")] internal static extern uint GetDpiForWindow(IntPtr hwnd);
         [DllImport("user32.dll")] internal static extern bool IsZoomed(IntPtr hwnd);
@@ -245,6 +244,25 @@ namespace MXterm.RdpHost
             return IntPtr.Size == 8
                 ? GetWindowLongPtr64(hwnd, ExtendedStyleIndex).ToInt64()
                 : (uint)GetWindowLong32(hwnd, ExtendedStyleIndex);
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern int SetCurrentProcessExplicitAppUserModelID(
+            [MarshalAs(UnmanagedType.LPWStr)] string appId);
+        [DllImport("shell32.dll", ExactSpelling = true)]
+        private static extern int GetCurrentProcessExplicitAppUserModelID(out IntPtr appId);
+
+        internal static bool SetAppUserModelId(string appId)
+        {
+            return !String.IsNullOrEmpty(appId) && SetCurrentProcessExplicitAppUserModelID(appId) >= 0;
+        }
+
+        internal static string GetProcessAppUserModelId()
+        {
+            IntPtr raw;
+            if (GetCurrentProcessExplicitAppUserModelID(out raw) < 0 || raw == IntPtr.Zero) return null;
+            try { return Marshal.PtrToStringUni(raw); }
+            finally { Marshal.FreeCoTaskMem(raw); }
         }
     }
 }

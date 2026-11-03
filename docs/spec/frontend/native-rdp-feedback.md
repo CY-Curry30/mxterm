@@ -30,6 +30,12 @@ The Windows RDP desktop is an ActiveX child HWND outside the React tree. Its con
 - Do not cache absolute virtual-desktop working-area coordinates in `Form.MaximizedBounds` during resize. Windows applies the monitor origin to these values, which can place a secondary-monitor window outside the desktop. Querying the current monitor for each request also avoids retaining another monitor's bounds after a move.
 - Minimized activation must restore the preceding normal/maximized state on the same available monitor. Geometry recovery for a disconnected monitor remains separate from maximization; a visible normal restore rectangle does not prove the maximized HWND is visible.
 
+## Taskbar identity
+
+- The main process sets `SetCurrentProcessExplicitAppUserModelID` to the bundle identifier before any window is created; the native host receives the same value as `--aumid` and applies it at startup. Both windows must keep that shared AppUserModelID: the taskbar then shows one button whose hover preview lists the main window and the remote desktop window, and either can be selected.
+- Do not hide the host with `WS_EX_TOOLWINDOW` or an owner window. That removes the second preview and the Alt+Tab entry, which contradicts the per-window selection the workbench relies on.
+- When another tab is active the host is parked off-screen; activating it from the taskbar preview emits `activated`, the frontend switches to that session and the existing bounds sync brings the host back into the pane.
+
 ## Verification
 
 - Run TypeScript checking, production build, startup module boundary checking, Rust formatting, and the focused `rdp::` tests. Run `node scripts/check-rdp-host-runtime.mjs <built-helper.exe>` on Windows to exercise installed controls, request correlation, shutdown, and parent-pipe EOF.

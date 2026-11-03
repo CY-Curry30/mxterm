@@ -13,8 +13,20 @@ namespace MXterm.RdpHost
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
             try
             {
-                if (args.Length == 1 && args[0] == "--self-test") return SelfTest.Run();
-                if (args.Length != 1 || args[0] != "--stdio") return 2;
+                string appId = null;
+                bool selfTest = false, stdio = false;
+                for (int index = 0; index < args.Length; index++)
+                {
+                    if (args[index] == "--self-test") selfTest = true;
+                    else if (args[index] == "--stdio") stdio = true;
+                    else if (args[index] == "--aumid" && index + 1 < args.Length) appId = args[++index];
+                    else return 2;
+                }
+                // 任务栏按 AppUserModelID 分组；与主进程一致才能合并为一个按钮，
+                // 并让悬停预览同时列出主窗口和本进程的远程桌面窗口。
+                if (appId != null && !Native.SetAppUserModelId(appId)) return 3;
+                if (selfTest) return SelfTest.Run(appId);
+                if (!stdio) return 2;
                 using (var host = new HostWindow())
                 {
                     IntPtr hwnd = host.Handle;

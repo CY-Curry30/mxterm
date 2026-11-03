@@ -197,6 +197,20 @@ fn event(app: &AppHandle, pid: u32, value: &Value) {
                 }
             }
         }
+        Some("activated") => {
+            // 任务栏缩略图激活了被移出屏幕的宿主窗口：交给前端把对应标签切回
+            // 前台，宿主位置再由既有 bounds 同步逻辑重新对齐。
+            if let Some(id) = value["session_id"].as_str() {
+                if manager
+                    .get(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|session| session.process_id == Some(pid))
+                {
+                    let _ = app.emit("rdp:session_activated", json!({ "session_id": id }));
+                }
+            }
+        }
         Some("connection") => {
             #[cfg(test)]
             if let Some(
@@ -249,6 +263,9 @@ impl Host {
         let executable = executable(app)?;
         let mut child = Command::new(&executable)
             .arg("--stdio")
+            // 与主进程共用任务栏身份：悬停时两个窗口出现在同一个缩略图列表里。
+            .arg("--aumid")
+            .arg(crate::APP_USER_MODEL_ID)
             .creation_flags(0x08000000) // CREATE_NO_WINDOW, WinForms shows its own UI.
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

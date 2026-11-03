@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
 
 const executable = process.argv[2];
 assert.ok(executable, "Pass the built mxterm-rdp.exe path");
-const { stdout } = await promisify(execFile)(executable, ["--self-test"], { timeout: 20000, windowsHide: true });
+// 任务栏分组依赖主进程与宿主使用同一个 AppUserModelID，取安装器实际写入的值。
+const bundleId = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8")).identifier;
+const { stdout } = await promisify(execFile)(executable, ["--aumid", bundleId, "--self-test"], { timeout: 20000, windowsHide: true });
 assert.ok(stdout.split(/\r?\n/).filter(Boolean).map(JSON.parse).some(v => v.event === "self_test" && v.ok));
 
 async function check(exitByEof) {

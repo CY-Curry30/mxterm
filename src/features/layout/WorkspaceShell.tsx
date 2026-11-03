@@ -375,6 +375,7 @@ import {
   emitVncRunnerWindowCloseRequest,
   emitVncRunnerWindowPayload,
   listenRdpSessionClosed,
+  listenRdpSessionActivated,
   listenTerminalOutput,
   listenTerminalConnectProgress,
   listenVncRunnerWindowClosed,
@@ -2601,6 +2602,40 @@ export function WorkspaceShell() {
       unlisten?.();
     };
   }, [activeConnectionId, activeRdpSessionId, activeWorkspaceMode, remoteFileTabs.length]);
+
+  useEffect(() => {
+    if (!hasTauriRuntime()) {
+      return;
+    }
+
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    // 任务栏缩略图选中了被移到屏外的宿主窗口：切回该标签，宿主位置由
+    // syncActiveRdpEmbeddedBounds 重新对齐到当前占位区。
+    void listenRdpSessionActivated((event) => {
+      if (disposed) {
+        return;
+      }
+      const session = rdpSessionsRef.current.find(
+        (item) => item.result?.session_id === event.session_id,
+      );
+      if (!session) {
+        return;
+      }
+      activateRdpSession(session);
+    }).then((cleanup) => {
+      if (disposed) {
+        cleanup();
+      } else {
+        unlisten = cleanup;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [activeConnectionId, activeRdpSessionId, activeWorkspaceMode]);
 
   useEffect(() => {
     if (!hasTauriRuntime()) {

@@ -433,6 +433,10 @@ export interface RdpSessionClosedEvent {
   session_id: string;
 }
 
+export interface RdpSessionActivatedEvent {
+  session_id: string;
+}
+
 export interface RdpEmbeddedBounds {
   x: number;
   y: number;

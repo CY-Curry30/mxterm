@@ -99,7 +99,7 @@ namespace MXterm.RdpHost
                     }
         }
 
-        internal static int Run()
+        internal static int Run(string expectedAppId)
         {
             int result = 1;
             string stage = "initialization";
@@ -112,7 +112,11 @@ namespace MXterm.RdpHost
                     {
                         stage = "taskbar";
                         long extended = Native.GetExtendedStyle(handle);
-                        Check((extended & Native.WsExToolWindow) != 0 && (extended & Native.WsExAppWindow) == 0, "host_hidden_from_taskbar");
+                        // 宿主窗口必须留在任务栏：与主窗口共享 AppUserModelID 后，
+                        // 悬停预览才会同时列出两个窗口供用户切换。
+                        Check((extended & Native.WsExToolWindow) == 0, "host_in_taskbar");
+                        if (expectedAppId != null)
+                            Check(Native.GetProcessAppUserModelId() == expectedAppId, "host_app_user_model_id");
                         stage = "configuration";
                         var sessions = new List<Session>();
                         for (int index = 0; index < 8; index++)
