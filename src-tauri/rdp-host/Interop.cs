@@ -206,7 +206,21 @@ namespace MXterm.RdpHost
     {
         [StructLayout(LayoutKind.Sequential)]
         internal struct WindowRect { internal int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct WindowPoint { internal int X, Y; }
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct MinMaxInfo
+        {
+            internal WindowPoint Reserved, MaxSize, MaxPosition, MinTrackSize, MaxTrackSize;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct NcCalcSizeParams
+        {
+            internal WindowRect Rect0, Rect1, Rect2;
+            internal IntPtr WindowPos;
+        }
         [DllImport("user32.dll")] internal static extern uint GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] internal static extern bool IsZoomed(IntPtr hwnd);
         [DllImport("user32.dll")] internal static extern IntPtr GetFocus();
         [DllImport("user32.dll")] internal static extern bool IsChild(IntPtr parent, IntPtr child);
         [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(IntPtr hwnd);

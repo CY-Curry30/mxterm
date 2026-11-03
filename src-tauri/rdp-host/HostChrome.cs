@@ -74,12 +74,12 @@ namespace MXterm.RdpHost
             if (Session != null)
             {
                 bool ready = Session.Phase == "login_complete", stopped = Session.Phase == "fatal" || Session.Phase == "disconnected";
-                var dot = new Rectangle(Dip(11), Height / 2 - Dip(3), Dip(6), Dip(6));
+                var dot = new Rectangle(Dip(10), Height / 2 - Dip(3), Dip(6), Dip(6));
                 using (var brush = new SolidBrush(stopped ? colors.Danger : ready ? colors.Success : colors.Primary))
                     if (ready || stopped) g.FillEllipse(brush, dot); else using (var pen = new Pen(brush, Math.Max(1, Dip(1)))) g.DrawEllipse(pen, dot);
-                TextRenderer.DrawText(g, HostChrome.Label(Session), Font, new Rectangle(Dip(25), 0, Math.Max(0, Width - Dip(54)), Height), foreground,
+                TextRenderer.DrawText(g, HostChrome.Label(Session), Font, new Rectangle(Dip(23), 0, Math.Max(0, Width - Dip(49)), Height), foreground,
                     TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
-                if (Selected) using (var pen = new Pen(colors.Primary, Math.Max(1, Dip(2)))) g.DrawLine(pen, Dip(12), Height - Dip(2), Width - Dip(12), Height - Dip(2));
+                if (Selected) using (var pen = new Pen(colors.Primary, Math.Max(1, Dip(2)))) g.DrawLine(pen, Dip(10), Height - Dip(2), Width - Dip(10), Height - Dip(2));
             }
             else
             {
@@ -111,6 +111,17 @@ namespace MXterm.RdpHost
 
     internal sealed class HostChrome : Control
     {
+        // Shared geometry keeps the WinForms strip and the host layout in sync.
+        internal const int HeightDip = 36;
+        internal const int CaptionWidthDip = 42;
+        internal const int CaptionReserveDip = CaptionWidthDip * 3;
+        internal const int TabMinWidthDip = 96;
+        internal const int TabMaxWidthDip = 172;
+        private const int TabStartDip = 68;
+        private const int TabGapDip = 4;
+        private const int TabRowInsetDip = 4;
+        private const int TabHeightDip = HeightDip - TabRowInsetDip * 2;
+
         private sealed class Tab
         {
             internal ChromeButton Select, Close;
@@ -243,28 +254,62 @@ namespace MXterm.RdpHost
             foreach (ToolStripItem item in menu.Items) if (item.Tag == session) item.Text = status;
         }
 
+        // Size each tab to its own title instead of a shared fixed width, so a
+        // short connection name no longer reserves an empty 200 DIP strip.
+        private int NaturalWidth(Session session)
+        {
+            Size text = TextRenderer.MeasureText(Label(session), Font, new Size(Int32.MaxValue, Int32.MaxValue),
+                TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            // Left inset + status dot + gap + label + gap + close button + right inset + tab gap.
+            int width = scale(10 + 6 + 7 + 6 + 20 + 4 + TabGapDip) + text.Width;
+            return Math.Max(scale(TabMinWidthDip), Math.Min(scale(TabMaxWidthDip), width));
+        }
+
         protected override void OnLayout(LayoutEventArgs e)
         {
             base.OnLayout(e);
             if (overflow == null || captions[2] == null) return;
-            int end = Width - scale(138), start = scale(80), room = Math.Max(1, end - start - scale(24));
-            int capacity = Math.Min(5, Math.Max(1, room / scale(144)));
-            if (ordered.Count > capacity) capacity = Math.Min(5, Math.Max(1, (room - scale(36)) / scale(144)));
-            visible.Clear(); overflowed.Clear();
-            for (int i = 0; i < Math.Min(capacity, ordered.Count); i++) visible.Add(ordered[i]);
+            int start = scale(TabStartDip), end = Width - scale(CaptionReserveDip);
+            int room = Math.Max(1, end - start - scale(20));
+            visible.Clear();
+            int available = Math.Max(1, room - (ordered.Count > 1 ? scale(28) : 0));
+            int used = 0;
+            // Fill the strip with as many readable labels as fit; do not squeeze
+            // every title down to an ellipsis just to reach the five-tab cap.
+            foreach (Session session in ordered)
+            {
+                if (visible.Count >= 5) break;
+                int width = NaturalWidth(session);
+                if (visible.Count > 0 && used + width > available) break;
+                visible.Add(session); used += width;
+            }
             if (active != null && !visible.Contains(active) && visible.Count > 0) visible[visible.Count - 1] = active;
+            overflowed.Clear();
             foreach (Session session in ordered) { tabs[session].Select.Visible = visible.Contains(session); if (!visible.Contains(session)) overflowed.Add(session); }
-            int tabWidth = Math.Min(scale(200), (room - (overflowed.Count > 0 ? scale(36) : 0)) / Math.Max(1, visible.Count));
+            int budget = Math.Max(1, room - (overflowed.Count > 0 ? scale(28) : 0));
+            int[] widths = new int[visible.Count];
+            int total = 0;
+            for (int i = 0; i < widths.Length; i++) { widths[i] = NaturalWidth(visible[i]); total += widths[i]; }
+            // Only compress when the natural widths cannot fit at all; leftover
+            // room stays empty rather than stretching short labels back out.
+            if (total > budget)
+            {
+                int each = Math.Max(1, budget / Math.Max(1, widths.Length));
+                for (int i = 0; i < widths.Length; i++) widths[i] = Math.Min(widths[i], each);
+            }
+            int x = start;
             for (int i = 0; i < visible.Count; i++)
             {
                 Tab tab = tabs[visible[i]];
-                tab.Select.Bounds = new Rectangle(start + i * tabWidth, scale(5), Math.Max(1, tabWidth - scale(4)), scale(30));
-                tab.Close.Bounds = new Rectangle(tab.Select.Width - scale(26), scale(4), scale(22), scale(22));
+                int tabWidth = Math.Max(1, widths[i] - scale(TabGapDip));
+                tab.Select.Bounds = new Rectangle(x, scale(TabRowInsetDip), tabWidth, scale(TabHeightDip));
+                tab.Close.Bounds = new Rectangle(tabWidth - scale(24), scale(TabRowInsetDip), scale(20), scale(20));
+                x += widths[i];
             }
             overflow.Visible = overflowed.Count > 0;
-            overflow.Bounds = new Rectangle(start + visible.Count * tabWidth, scale(5), scale(32), scale(30));
+            overflow.Bounds = new Rectangle(x, scale(TabRowInsetDip), scale(24), scale(TabHeightDip));
             tips.SetToolTip(overflow, "其他 RDP 连接（" + overflowed.Count + "）");
-            for (int i = 0; i < 3; i++) captions[i].Bounds = new Rectangle(end + scale(46 * i), 0, scale(46), scale(40));
+            for (int i = 0; i < 3; i++) captions[i].Bounds = new Rectangle(end + scale(CaptionWidthDip * i), 0, scale(CaptionWidthDip), Height);
         }
 
         internal void OpenOverflow()
@@ -284,8 +329,8 @@ namespace MXterm.RdpHost
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            if (icon != null) e.Graphics.DrawIcon(icon, new Rectangle(scale(12), scale(12), scale(16), scale(16)));
-            TextRenderer.DrawText(e.Graphics, "RDP", Font, new Rectangle(scale(34), 0, scale(40), Height), palette.Muted, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            if (icon != null) e.Graphics.DrawIcon(icon, new Rectangle(scale(10), scale(10), scale(16), scale(16)));
+            TextRenderer.DrawText(e.Graphics, "RDP", Font, new Rectangle(scale(30), 0, scale(34), Height), palette.Muted, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
             using (var pen = new Pen(palette.Line)) e.Graphics.DrawLine(pen, 0, Height - 1, Width, Height - 1);
         }
 

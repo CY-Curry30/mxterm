@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -44,6 +45,26 @@ namespace MXterm.RdpHost
             };
         }
 
+        private static void CheckMaximizedGeometry(HostWindow host)
+        {
+            Screen screen = Screen.FromHandle(host.Handle);
+            Rectangle work = screen.WorkingArea;
+            Protocol.Write(new
+            {
+                @event = "geometry_probe",
+                window = new { x = host.Left, y = host.Top, width = host.Width, height = host.Height },
+                client = new { width = host.ClientSize.Width, height = host.ClientSize.Height },
+                work = new { x = work.X, y = work.Y, width = work.Width, height = work.Height },
+                bounds = new { x = screen.Bounds.X, y = screen.Bounds.Y, width = screen.Bounds.Width, height = screen.Bounds.Height },
+                dpi = Native.GetDpiForWindow(host.Handle)
+            });
+            // The window rectangle may still carry the off-screen DWM resize
+            // frame; the client area, which hosts the remote desktop, must
+            // cover the work area exactly with no seam.
+            Check(Math.Abs(host.ClientSize.Width - work.Width) <= 1 && Math.Abs(host.ClientSize.Height - work.Height) <= 1,
+                "maximized_client_fills_work_area");
+        }
+
         private static void CheckLayouts(IList<Session> sessions, Session active)
         {
             Check(NativePalette.Decode(0x563412).ToArgb() == Color.FromArgb(0x12, 0x34, 0x56).ToArgb(), "colorref");
@@ -56,7 +77,7 @@ namespace MXterm.RdpHost
                         Func<int, int> scale = value => (int)Math.Round(value * dpi / 96.0);
                         using (var chrome = new HostChrome(scale, null, delegate { }, delegate { }, delegate { }, delegate { }))
                         {
-                            chrome.Size = new Size(scale(width), scale(40));
+                            chrome.Size = new Size(scale(width), scale(HostChrome.HeightDip));
                             chrome.UpdateSessions(sessions, active, Palette(dark), false);
                             Check(chrome.VisibleSessions.Count <= 5 && chrome.VisibleSessions.Contains(active), "overflow_active_visible");
                             Check(chrome.VisibleSessions.Count + chrome.OverflowSessions.Count == sessions.Count, "overflow_session_count");
@@ -64,7 +85,8 @@ namespace MXterm.RdpHost
                             foreach (Session session in chrome.VisibleSessions)
                             {
                                 Rectangle bounds = chrome.SelectButton(session).Bounds;
-                                Check(bounds.Left >= previousRight && bounds.Right <= scale(width - 138 - 24), "tab_caption_bounds");
+                                Check(bounds.Left >= previousRight && bounds.Right <= scale(width - HostChrome.CaptionReserveDip - 20), "tab_caption_bounds");
+                                Check(bounds.Width <= scale(HostChrome.TabMaxWidthDip) && bounds.Width < scale(200), "tab_adaptive_width");
                                 previousRight = bounds.Right;
                             }
                             if (!String.IsNullOrEmpty(output))
@@ -92,11 +114,18 @@ namespace MXterm.RdpHost
                         var sessions = new List<Session>();
                         for (int index = 0; index < 8; index++)
                         {
+                            stage = "configuration-" + index;
                             int mode = index % 3;
                             var config = new RdpConfig { host = "192.0.2.1", username = "example", title = "MXterm RDP - 远程桌面 " + (index + 1),
                                 port = 3389, width = 1024, height = 768, color_depth = 32, keyboard_hook_mode = mode,
                                 dynamic_resize = true, nla = true, password = "fixture", appearance = Palette(false) };
-                            Session session = host.AddSession("test-" + index, config, false);
+                            Session session;
+                            try { session = host.AddSession("test-" + index, config, false); }
+                            catch (Exception error)
+                            {
+                                Protocol.Write(new { @event = "self_test_detail", type = error.GetType().FullName, message = error.Message, hresult = error.HResult, inner = error.InnerException == null ? "" : error.InnerException.ToString() });
+                                throw;
+                            }
                             sessions.Add(session);
                             Check(config.password == null && session.Ax.Parent == host && session.Events != null, "control_lifecycle");
                             Check(Convert.ToInt32(Com.Property(Com.Get(session.Client, 102), "KeyboardHookMode")) == mode, "keyboard_mode");
@@ -122,6 +151,35 @@ namespace MXterm.RdpHost
                         host.OnConnectionEvent(active, "disconnected", 1);
                         host.OnConnectionEvent(active, "login_complete", 0);
                         Check(active.Feedback.Visible && active.Retry.Visible && active.Phase == "disconnected", "disconnect_feedback");
+                        Check(active.Feedback.Width < host.ClientSize.Width && active.Feedback.Height < 64, "compact_feedback");
+                        stage = "hidden_session_parking";
+                        Session background = sessions[0];
+                        background.Phase = "login_complete";
+                        background.HiddenSince = Stopwatch.GetTimestamp() - 6 * Stopwatch.Frequency;
+                        Check(host.ShouldParkSession(background, Stopwatch.GetTimestamp()), "inactive_dynamic_session_parked");
+                        background.Config.dynamic_resize = false;
+                        Check(!host.ShouldParkSession(background, Stopwatch.GetTimestamp()), "fixed_resolution_session_unchanged");
+                        background.Config.dynamic_resize = true;
+                        background.HiddenSince = null;
+
+                        stage = "window_wake";
+                        host.WindowState = FormWindowState.Maximized;
+                        Application.DoEvents();
+                        CheckMaximizedGeometry(host);
+                        host.WindowState = FormWindowState.Minimized;
+                        Application.DoEvents();
+                        host.Reveal();
+                        Application.DoEvents();
+                        Check(host.WindowState == FormWindowState.Maximized, "wake_restores_maximized");
+                        host.WindowState = FormWindowState.Normal;
+                        Application.DoEvents();
+                        host.WindowState = FormWindowState.Minimized;
+                        Application.DoEvents();
+                        host.Reveal();
+                        Application.DoEvents();
+                        Check(host.WindowState == FormWindowState.Normal, "wake_restores_normal");
+                        Rectangle offscreen = new Rectangle(-30000, -30000, host.Width, host.Height);
+                        Check(HostWindow.IsMeaningfullyVisible(HostWindow.EnsureVisible(offscreen)), "wake_repositions_offscreen_window");
 
                         stage = "tab_switch";
                         host.Chrome.SelectButton(sessions[0]).PerformClick();

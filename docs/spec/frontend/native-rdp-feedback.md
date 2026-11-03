@@ -17,12 +17,18 @@ The Windows RDP desktop is an ActiveX child HWND outside the React tree. Its con
 
 ## Native tabs
 
-- Keep a single 40 DIP title strip with the app mark, connection tabs and native window controls on the same row. Use compact corners, a fine border, token colors, vector glyphs, connection status dots and full-title tooltips. Scale geometry and typography for the host monitor.
+- Keep a single 36 DIP title strip with the app mark, connection tabs and native window controls on the same row. Size each tab from its measured title within 96–172 DIP instead of a shared fixed width, so short connection names stay compact and long ones truncate. Use compact corners, a fine border, token colors, vector glyphs, connection status dots and full-title tooltips. Scale geometry and typography for the host monitor.
 - New connections start from the existing main-window connection list and join the shared native host. Do not add a separate connection-creation button or persist native tab order in connection profiles.
-- Show up to five tabs as space permits. An overflow menu lists the remaining sessions with their connection status. Selecting an overflow item brings that session into the visible strip; the active tab must always remain visible. Recalculate visibility on every activation even when no controls are added or resized.
+- Show up to five tabs, filling the strip with readable labels before compressing or overflowing the rest. An overflow menu lists the remaining sessions with their connection status. Selecting an overflow item brings that session into the visible strip; the active tab must always remain visible. Recalculate visibility on every activation even when no controls are added or resized.
 - Clicking a tab activates its existing AxHost and explicitly restores remote desktop focus. Dismissing the overflow menu restores focus after the native menu closes. Authentication dialogs retain their normal focus flow. Do not replace AxHost keyboard preprocessing to implement tab interaction.
 - The close button and middle click share the same session-close path. Closing a background tab preserves the active session; closing the active tab selects its right neighbor, or the previous tab at the end. Closing the final tab exits the host. Preserve backend session ids through these operations.
 - Native child HWNDs cannot contain Radix controls. Use real accessible WinForms buttons and ContextMenuStrip with the shared token palette for this surface; React menus continue to use the shared Radix components.
+
+## Native window placement
+
+- Resolve maximized geometry in `WM_GETMINMAXINFO` against the host's current monitor. `ptMaxPosition` uses working-area offsets relative to the monitor origin; `ptMaxSize` uses physical working-area dimensions. Do not pre-shrink the request by the resize frame: once the request fills the work area Windows grows the window rectangle by that frame on every edge. Clamp the maximized client rect back to the work area in `WM_NCCALCSIZE` instead, so the remote desktop reaches the screen edge while the DWM frame stays off-screen. Preserve the minimum tracking size computed by WinForms.
+- Do not cache absolute virtual-desktop working-area coordinates in `Form.MaximizedBounds` during resize. Windows applies the monitor origin to these values, which can place a secondary-monitor window outside the desktop. Querying the current monitor for each request also avoids retaining another monitor's bounds after a move.
+- Minimized activation must restore the preceding normal/maximized state on the same available monitor. Geometry recovery for a disconnected monitor remains separate from maximization; a visible normal restore rectangle does not prove the maximized HWND is visible.
 
 ## Verification
 

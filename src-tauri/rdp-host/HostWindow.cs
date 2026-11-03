@@ -3,12 +3,94 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace MXterm.RdpHost
 {
+    internal sealed class FeedbackPanel : Panel
+    {
+        private Color borderColor;
+        private bool hasAppearance;
+        private int radius;
+
+        internal FeedbackPanel()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        }
+
+        internal void SetAppearance(Color background, Color border, int cornerRadius)
+        {
+            if (hasAppearance && BackColor == background && borderColor == border && radius == cornerRadius) return;
+            BackColor = background;
+            borderColor = border;
+            radius = cornerRadius;
+            hasAppearance = true;
+            UpdateRegion();
+            Invalidate();
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            UpdateRegion();
+        }
+
+        private void UpdateRegion()
+        {
+            // Keep the native panel rectangular for reliable child HWND clipping;
+            // the rounded border is drawn in OnPaint without changing hit testing.
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), radius))
+            using (var pen = new Pen(borderColor)) e.Graphics.DrawPath(pen, path);
+        }
+
+        private static GraphicsPath RoundedPath(Rectangle bounds, int radius)
+        {
+            var path = new GraphicsPath();
+            int diameter = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
+            if (diameter <= 0) { path.AddRectangle(bounds); return path; }
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    internal sealed class FeedbackMark : Control
+    {
+        private Color statusColor;
+        internal Color StatusColor
+        {
+            get { return statusColor; }
+            set { if (statusColor != value) { statusColor = value; Invalidate(); } }
+        }
+
+        internal FeedbackMark()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            AccessibleRole = AccessibleRole.Indicator;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            int diameter = Math.Min(Width, Height) - 2;
+            if (diameter <= 0) return;
+            var bounds = new Rectangle((Width - diameter) / 2, (Height - diameter) / 2, diameter, diameter);
+            using (var brush = new SolidBrush(statusColor)) e.Graphics.FillEllipse(brush, bounds);
+        }
+    }
+
     internal sealed class Session : IDisposable
     {
         internal string Id;
@@ -17,6 +99,7 @@ namespace MXterm.RdpHost
         internal RdpConfig Config;
         internal RdpEvents Events;
         internal Panel Feedback;
+        internal FeedbackMark FeedbackMark;
         internal Label Message;
         internal Button Retry;
         internal string Phase = "connecting";
@@ -41,10 +124,12 @@ namespace MXterm.RdpHost
 
     internal sealed class HostWindow : Form
     {
+        private const int HiddenSessionParkDelaySeconds = 5;
         private readonly List<Session> sessions = new List<Session>();
         private readonly Timer maintenance = new Timer { Interval = 300 };
         private Session active;
         private bool allowShow, closing;
+        private FormWindowState restoreWindowState = FormWindowState.Normal;
         private Appearance appearance;
         private readonly Icon appIcon;
         private readonly HostChrome chrome;
@@ -54,7 +139,7 @@ namespace MXterm.RdpHost
         internal HostChrome Chrome { get { return chrome; } }
         private int Dip(int value) { return (int)Math.Round(value * Dpi / 96.0); }
         private uint Dpi { get { return IsHandleCreated ? Native.GetDpiForWindow(Handle) : 96; } }
-        private int ChromeHeight { get { return Dip(40); } }
+        private int ChromeHeight { get { return Dip(HostChrome.HeightDip); } }
         private Color PanelColor { get { return appearance == null ? SystemColors.Control : Rgb(appearance.panel); } }
         private Color TextColor { get { return appearance == null ? SystemColors.ControlText : Rgb(appearance.text); } }
         private Color MutedColor { get { return appearance == null ? SystemColors.GrayText : Rgb(appearance.muted); } }
@@ -140,30 +225,72 @@ namespace MXterm.RdpHost
         {
             if (state != null)
             {
-                Bounds = new Rectangle(state.x, state.y, Math.Max(720, state.width), Math.Max(480, state.height));
-                if (!OnScreen(Bounds)) StartPosition = FormStartPosition.CenterScreen;
-                else StartPosition = FormStartPosition.Manual;
-                if (state.maximized) WindowState = FormWindowState.Maximized;
+                Rectangle restored = new Rectangle(state.x, state.y, Math.Max(720, state.width), Math.Max(480, state.height));
+                Bounds = EnsureVisible(restored);
+                StartPosition = FormStartPosition.Manual;
+                restoreWindowState = state.maximized ? FormWindowState.Maximized : FormWindowState.Normal;
+                WindowState = restoreWindowState;
             }
             else if (bounds != null)
             {
-                Size = new Size(Math.Max(720, bounds.width), Math.Max(480, bounds.height + ChromeHeight));
-                if (bounds.x != Int32.MinValue && bounds.y != Int32.MinValue)
-                { Location = new Point(bounds.x, bounds.y); StartPosition = FormStartPosition.Manual; }
+                Rectangle requested = new Rectangle(
+                    bounds.x == Int32.MinValue ? Left : bounds.x,
+                    bounds.y == Int32.MinValue ? Top : bounds.y,
+                    Math.Max(720, bounds.width), Math.Max(480, bounds.height + ChromeHeight));
+                Bounds = EnsureVisible(requested);
+                StartPosition = FormStartPosition.Manual;
             }
         }
 
-        private static bool OnScreen(Rectangle bounds)
+        internal static bool IsMeaningfullyVisible(Rectangle bounds)
         {
-            foreach (Screen screen in Screen.AllScreens) if (screen.WorkingArea.IntersectsWith(bounds)) return true;
+            foreach (Screen screen in Screen.AllScreens)
+            {
+                Rectangle visible = Rectangle.Intersect(screen.WorkingArea, bounds);
+                if (visible.Width >= 160 && visible.Height >= 120) return true;
+            }
             return false;
         }
 
-        private void Reveal()
+        internal static Rectangle EnsureVisible(Rectangle bounds)
+        {
+            if (IsMeaningfullyVisible(bounds)) return bounds;
+            Rectangle work = (Screen.PrimaryScreen ?? Screen.AllScreens[0]).WorkingArea;
+            int x = work.Left + Math.Max(0, (work.Width - bounds.Width) / 2);
+            int y = work.Top + Math.Max(0, (work.Height - bounds.Height) / 2);
+            return new Rectangle(x, y, bounds.Width, bounds.Height);
+        }
+
+        internal static void ApplyMaximizedBounds(ref Native.MinMaxInfo info, Rectangle monitor, Rectangle work)
+        {
+            // WM_GETMINMAXINFO uses offsets from the monitor origin, not
+            // absolute virtual-desktop coordinates. ptMaxPosition/ptMaxSize are
+            // the final window rectangle for this borderless host: because
+            // WM_NCCALCSIZE already removed the non-client area, Windows does
+            // not add the resize frame around the request. Subtracting the
+            // frame here left an 8 DIP gap on the left and top edges.
+            info.MaxPosition.X = work.Left - monitor.Left;
+            info.MaxPosition.Y = work.Top - monitor.Top;
+            info.MaxSize.X = Math.Max(1, work.Width);
+            info.MaxSize.Y = Math.Max(1, work.Height);
+        }
+
+        internal void Reveal()
         {
             allowShow = true;
-            if (!OnScreen(Bounds)) Location = new Point(Screen.PrimaryScreen.WorkingArea.Left + Dip(40), Screen.PrimaryScreen.WorkingArea.Top + Dip(40));
-            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            bool minimized = WindowState == FormWindowState.Minimized;
+            Rectangle restored = minimized ? RestoreBounds : WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            if (!IsMeaningfullyVisible(restored))
+            {
+                Bounds = EnsureVisible(restored);
+                restoreWindowState = FormWindowState.Normal;
+                WindowState = FormWindowState.Normal;
+            }
+            else if (minimized)
+            {
+                Bounds = restored;
+                WindowState = restoreWindowState;
+            }
             Show();
             Native.SetForegroundWindow(Handle);
             Activate();
@@ -245,14 +372,38 @@ namespace MXterm.RdpHost
 
         private void CreateFeedback(Session session)
         {
-            var panel = new Panel { BackColor = PanelColor, Height = Dip(64), AccessibleName = "远程桌面连接状态" };
-            var label = new Label { ForeColor = MutedColor, BackColor = PanelColor, AutoSize = false, TextAlign = ContentAlignment.MiddleLeft };
-            var retry = new Button { Text = "重试连接", AccessibleName = "重试连接", FlatStyle = FlatStyle.Flat, ForeColor = TextColor, BackColor = PanelColor };
+            var panel = new FeedbackPanel { Height = Dip(52), AccessibleName = "远程桌面连接状态" };
+            var mark = new FeedbackMark { Size = new Size(Dip(9), Dip(9)), BackColor = PanelColor };
+            var label = new Label { ForeColor = MutedColor, BackColor = Color.Transparent, AutoSize = false, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
+            var retry = new Button { Text = "重试连接", AccessibleName = "重试连接", FlatStyle = FlatStyle.Flat, ForeColor = TextColor, BackColor = PanelColor, UseVisualStyleBackColor = false };
             retry.FlatAppearance.BorderColor = LineColor;
             retry.Click += delegate { Retry(session); };
-            panel.Controls.Add(label); panel.Controls.Add(retry); Controls.Add(panel);
-            session.Feedback = panel; session.Message = label; session.Retry = retry;
+            panel.Controls.Add(mark); panel.Controls.Add(label); panel.Controls.Add(retry); Controls.Add(panel);
+            session.Feedback = panel; session.FeedbackMark = mark; session.Message = label; session.Retry = retry;
             UpdateFeedback(session);
+        }
+
+        private void ApplyFeedbackAppearance(Session session)
+        {
+            Appearance palette = session.Config == null ? null : session.Config.appearance;
+            Color panel = palette == null ? SystemColors.Control : Rgb(palette.panel);
+            Color text = palette == null ? SystemColors.ControlText : Rgb(palette.text);
+            Color muted = palette == null ? SystemColors.GrayText : Rgb(palette.muted);
+            Color line = palette == null ? SystemColors.ControlDark : Rgb(palette.line);
+            session.Feedback.BackColor = panel;
+            ((FeedbackPanel)session.Feedback).SetAppearance(panel, line, Dip(6));
+            session.FeedbackMark.BackColor = panel;
+            session.Message.ForeColor = text;
+            session.Retry.ForeColor = text;
+            session.Retry.BackColor = panel;
+            session.Retry.FlatAppearance.BorderColor = line;
+            Color accent = session.Phase == "fatal" || session.Phase == "disconnected"
+                ? palette == null ? SystemColors.HotTrack : Rgb(palette.danger)
+                : session.Phase == "login_complete"
+                    ? palette == null || !palette.success.HasValue ? SystemColors.Highlight : Rgb(palette.success.Value)
+                    : palette == null ? muted : Rgb(palette.primary);
+            session.FeedbackMark.StatusColor = accent;
+            session.FeedbackMark.Invalidate();
         }
 
         internal void OnConnectionEvent(Session session, string phase, int code)
@@ -303,6 +454,7 @@ namespace MXterm.RdpHost
 
         private void UpdateFeedback(Session session)
         {
+            if (session.Feedback == null || session.Message == null || session.Retry == null) return;
             bool stopped = session.Phase == "disconnected" || session.Phase == "fatal";
             if (!stopped)
             {
@@ -311,10 +463,17 @@ namespace MXterm.RdpHost
                 if (SecondsSince(session.Started) >= 20 && session.Phase != "login_complete")
                     session.Message.Text += "  请检查远程登录或身份验证提示。";
             }
+            ApplyFeedbackAppearance(session);
             Rectangle desktop = ContentBounds();
-            session.Feedback.Bounds = new Rectangle(desktop.Left + Dip(8), desktop.Top + Dip(session.Phase == "connected" ? 44 : 8), Math.Max(1, desktop.Width - Dip(16)), Dip(64));
-            session.Message.Bounds = new Rectangle(Dip(12), 0, Math.Max(1, session.Feedback.Width - Dip(stopped ? 130 : 24)), session.Feedback.Height);
-            session.Retry.Bounds = new Rectangle(Math.Max(0, session.Feedback.Width - Dip(112)), Dip(16), Dip(100), Dip(30));
+            int width = Math.Min(Dip(560), Math.Max(Dip(320), desktop.Width - Dip(16)));
+            int height = Dip(52);
+            int left = desktop.Left + Math.Max(0, (desktop.Width - width) / 2);
+            int top = desktop.Top + Dip(session.Phase == "connected" ? 44 : 8);
+            session.Feedback.Bounds = new Rectangle(left, top, width, height);
+            int trailing = stopped ? Dip(124) : Dip(14);
+            session.Message.Bounds = new Rectangle(Dip(36), 0, Math.Max(Dip(100), width - Dip(36) - trailing), height);
+            session.FeedbackMark.Location = new Point(Dip(16), (height - session.FeedbackMark.Height) / 2);
+            session.Retry.Bounds = new Rectangle(width - Dip(112), (height - Dip(30)) / 2, Dip(100), Dip(30));
             session.Retry.Visible = stopped;
             session.Feedback.Visible = session == active && session.Phase != "login_complete" && !session.Dialog && WindowState != FormWindowState.Minimized;
             if (session.Feedback.Visible) session.Feedback.BringToFront();
@@ -412,7 +571,7 @@ namespace MXterm.RdpHost
         {
             base.OnResize(e);
             if (!IsHandleCreated || sessions == null) return;
-            MaximizedBounds = Screen.FromHandle(Handle).WorkingArea;
+            if (WindowState != FormWindowState.Minimized) restoreWindowState = WindowState;
             SynchronizeChrome();
             foreach (Session session in sessions)
             {
@@ -443,10 +602,17 @@ namespace MXterm.RdpHost
                         SyncDisplay(session, session.Ax.Width, session.Ax.Height, Dpi, false);
                     }
                 }
-                else if (session.HiddenSince != null && SecondsSince(session.HiddenSince.Value) >= 30 && !session.Parked && session.Phase == "login_complete" && session.Config.dynamic_resize)
+                else if (ShouldParkSession(session, Stopwatch.GetTimestamp()))
                     SyncDisplay(session, 640, 480, 96, true);
                 if (session.Phase != "login_complete") UpdateFeedback(session);
             }
+        }
+
+        internal bool ShouldParkSession(Session session, long now)
+        {
+            return session.Config != null && session.Config.dynamic_resize && session.Phase == "login_complete"
+                && session.HiddenSince.HasValue && !session.Parked
+                && (now - session.HiddenSince.Value) / (double)Stopwatch.Frequency >= HiddenSessionParkDelaySeconds;
         }
 
         private static void SyncDisplay(Session session, int width, int height, uint dpi, bool park)
@@ -468,9 +634,11 @@ namespace MXterm.RdpHost
             closing = true;
             maintenance.Stop();
             chrome.Hide();
+            bool maximized = WindowState == FormWindowState.Maximized || restoreWindowState == FormWindowState.Maximized;
             Rectangle normal = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            normal = EnsureVisible(normal);
             Protocol.Write(new { @event = "window_state", state = new WindowState { x = normal.X, y = normal.Y,
-                width = normal.Width, height = normal.Height, maximized = WindowState == FormWindowState.Maximized } });
+                width = normal.Width, height = normal.Height, maximized = maximized } });
             foreach (Session session in sessions.ToArray()) CloseSession(session.Id);
             base.OnFormClosing(e);
         }
@@ -483,11 +651,41 @@ namespace MXterm.RdpHost
 
         protected override void WndProc(ref Message message)
         {
-            const int WM_NCCALCSIZE = 0x83, WM_NCHITTEST = 0x84, WM_DPICHANGED = 0x2e0;
+            const int WM_GETMINMAXINFO = 0x24, WM_NCCALCSIZE = 0x83, WM_NCHITTEST = 0x84, WM_DPICHANGED = 0x2e0;
             if (message.Msg == WM_NCCALCSIZE && message.WParam != IntPtr.Zero)
-            { message.Result = IntPtr.Zero; return; }
+            {
+                // Keep the maximized client area inside the work area. Windows
+                // grows the window rectangle by the resize frame on every edge
+                // once it fills the work area; that frame stays off-screen, but
+                // its counterpart must not push the remote desktop past it.
+                if (Native.IsZoomed(Handle))
+                {
+                    var parameters = (Native.NcCalcSizeParams)Marshal.PtrToStructure(message.LParam, typeof(Native.NcCalcSizeParams));
+                    var proposed = Rectangle.FromLTRB(parameters.Rect0.Left, parameters.Rect0.Top, parameters.Rect0.Right, parameters.Rect0.Bottom);
+                    // Judge the target monitor from the proposed client rect:
+                    // during a maximize across monitors the window handle can
+                    // still report the previous screen.
+                    Rectangle fitted = Rectangle.Intersect(proposed, Screen.FromRectangle(proposed).WorkingArea);
+                    if (fitted != proposed && fitted.Width > 0 && fitted.Height > 0)
+                    {
+                        parameters.Rect0.Left = fitted.Left; parameters.Rect0.Top = fitted.Top;
+                        parameters.Rect0.Right = fitted.Right; parameters.Rect0.Bottom = fitted.Bottom;
+                        Marshal.StructureToPtr(parameters, message.LParam, false);
+                    }
+                }
+                message.Result = IntPtr.Zero;
+                return;
+            }
             base.WndProc(ref message);
-            if (message.Msg == WM_NCHITTEST)
+            if (message.Msg == WM_GETMINMAXINFO)
+            {
+                Screen screen = Screen.FromHandle(Handle);
+                var info = (Native.MinMaxInfo)Marshal.PtrToStructure(message.LParam, typeof(Native.MinMaxInfo));
+                ApplyMaximizedBounds(ref info, screen.Bounds, screen.WorkingArea);
+                Marshal.StructureToPtr(info, message.LParam, false);
+                message.Result = IntPtr.Zero;
+            }
+            else if (message.Msg == WM_NCHITTEST)
             {
                 long pos = message.LParam.ToInt64();
                 Point point = PointToClient(new Point((short)(pos & 0xffff), (short)((pos >> 16) & 0xffff)));
