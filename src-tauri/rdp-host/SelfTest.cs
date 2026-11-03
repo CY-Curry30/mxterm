@@ -110,6 +110,9 @@ namespace MXterm.RdpHost
                 {
                     try
                     {
+                        stage = "taskbar";
+                        long extended = Native.GetExtendedStyle(handle);
+                        Check((extended & Native.WsExToolWindow) != 0 && (extended & Native.WsExAppWindow) == 0, "host_hidden_from_taskbar");
                         stage = "configuration";
                         var sessions = new List<Session>();
                         for (int index = 0; index < 8; index++)

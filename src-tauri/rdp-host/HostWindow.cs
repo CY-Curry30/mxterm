@@ -150,6 +150,12 @@ namespace MXterm.RdpHost
         internal HostWindow()
         {
             Text = "MXterm RDP";
+            // The host is the native surface for a workbench pane, not a second
+            // application: an unowned top-level Form would get its own taskbar
+            // button (and Alt+Tab entry) next to the main window. The explicit
+            // CreateParams flag below is authoritative; this property documents
+            // the intent and keeps WinForms' own taskbar bookkeeping in sync.
+            ShowInTaskbar = false;
             AutoScaleMode = AutoScaleMode.None;
             MinimumSize = new Size(720, 480);
             Size = new Size(1280, 860);
@@ -168,6 +174,20 @@ namespace MXterm.RdpHost
             SynchronizeChrome();
             maintenance.Tick += delegate { MaintainSessions(); };
             maintenance.Start();
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                // WS_EX_TOOLWINDOW is the only style Win32 honours when keeping a
+                // top-level window out of the taskbar and the Alt+Tab list. It is
+                // applied at handle creation and survives handle recreation, so
+                // the host can never flash a second taskbar button.
+                CreateParams parameters = base.CreateParams;
+                parameters.ExStyle |= Native.WsExToolWindow;
+                return parameters;
+            }
         }
 
         protected override void SetVisibleCore(bool value) { base.SetVisibleCore(value && allowShow); }

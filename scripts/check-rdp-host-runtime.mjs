@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { once } from "node:events";
 
 const executable = process.argv[2];
-assert.ok(executable, "Pass the built mxterm-rdp-host.exe path");
+assert.ok(executable, "Pass the built mxterm-rdp.exe path");
 const { stdout } = await promisify(execFile)(executable, ["--self-test"], { timeout: 20000, windowsHide: true });
 assert.ok(stdout.split(/\r?\n/).filter(Boolean).map(JSON.parse).some(v => v.event === "self_test" && v.ok));
 

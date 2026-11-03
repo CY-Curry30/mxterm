@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use tauri::{Emitter, Manager};
 
-const BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mxterm-rdp-host.exe"));
+const BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mxterm-rdp.exe"));
 const TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Serialize)]
@@ -136,7 +136,7 @@ pub(super) fn executable(app: &AppHandle) -> Result<PathBuf, AppError> {
         .join("rdp-host")
         .join(digest);
     fs::create_dir_all(&directory).map_err(|_| failure("rdp_host_cache_failed"))?;
-    let path = directory.join("mxterm-rdp-host.exe");
+    let path = directory.join("mxterm-rdp.exe");
     if fs::read(&path).is_ok_and(|data| data == BINARY) {
         return Ok(path);
     }

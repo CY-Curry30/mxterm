@@ -219,6 +219,10 @@ namespace MXterm.RdpHost
             internal WindowRect Rect0, Rect1, Rect2;
             internal IntPtr WindowPos;
         }
+        internal const int ExtendedStyleIndex = -20;
+        internal const int WsExToolWindow = 0x00000080;
+        internal const int WsExAppWindow = 0x00040000;
+
         [DllImport("user32.dll")] internal static extern uint GetDpiForWindow(IntPtr hwnd);
         [DllImport("user32.dll")] internal static extern bool IsZoomed(IntPtr hwnd);
         [DllImport("user32.dll")] internal static extern IntPtr GetFocus();
@@ -228,5 +232,19 @@ namespace MXterm.RdpHost
         [DllImport("user32.dll")] internal static extern bool ReleaseCapture();
         [DllImport("user32.dll")] internal static extern IntPtr SendMessage(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam);
         [DllImport("dwmapi.dll")] internal static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        private static extern int GetWindowLong32(IntPtr hwnd, int index);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+        private static extern IntPtr GetWindowLongPtr64(IntPtr hwnd, int index);
+
+        // GetWindowLongPtrW has no 32-bit export; the x86 build must use the
+        // 32-bit entry point through the same call site.
+        internal static long GetExtendedStyle(IntPtr hwnd)
+        {
+            return IntPtr.Size == 8
+                ? GetWindowLongPtr64(hwnd, ExtendedStyleIndex).ToInt64()
+                : (uint)GetWindowLong32(hwnd, ExtendedStyleIndex);
+        }
     }
 }
